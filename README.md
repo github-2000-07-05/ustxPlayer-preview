@@ -4,7 +4,7 @@
 
 # ustxPlayer
 
-`v26g30` · 基于 [ustPlayer](https://github.com/SYEternalR/ustPlayer) 二次开发的 USTX 工程可视化工具。
+`v26h04` · 基于 [ustPlayer](https://github.com/SYEternalR/ustPlayer) 二次开发的 USTX 工程可视化工具。
 
 ![GitHub Release](https://img.shields.io/github/v/release/lyrinXD/ustxPlayer?style=for-the-badge)
 ![GitHub All Releases](https://img.shields.io/github/downloads/lyrinXD/ustxPlayer/total?style=for-the-badge)
@@ -85,12 +85,12 @@ python -m nuitka --standalone --enable-plugin=pyside6 main.py
 - 歌词推荐使用 **交错** 或 **独立** 格式；合并格式可能显示异常。
 - 工程文件（`.uplr`）采用全新格式，**不兼容旧版 ustPlayer 的 `.uplr` 文件**。新格式内嵌 USTX 内容，可独立分发，无需额外携带 `.ustx` 文件。
 - 工程文件（.uplr）中的 ustx 等文件路径**可以为空**，故工程文件可做模板使用。
-- 同时打开两个界面可能会出现异常。
+- 同时打开两个界面会出现异常的BUG已在v26h04版本修复修复。
 
 
 ## 致谢
 
-本项目基于 **[ustPlayer](https://github.com/SYEternalR/ustPlayer)** 二次开发，原项目由 **[SYEternal_R](https://github.com/SYEternalR)** 与 **[灰棱HiRenG](https://github.com/HiRenG1145)** 创建。
+本项目时基于 **[ustPlayer](https://github.com/SYEternalR/ustPlayer)** 二次开发的第三方优化版，由github-2000-07-05修改，原项目由 **[SYEternal_R](https://github.com/SYEternalR)** 与 **[灰棱HiRenG](https://github.com/HiRenG1145)** 创建。
 
 ### 使用的资源与库
 
