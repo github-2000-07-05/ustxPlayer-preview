@@ -332,9 +332,12 @@ def _detect_nvidia() -> Optional[Dict[str, Any]]:
         vram_free_mb = float(first[2]) if first[2] else 0
         gpu_count = max(1, int(first[3])) if len(first) > 3 and first[3] else 1
 
-        # 通过 CUDA 样例查询 CUDA 核心数
-        # 方法: 用 nvidia-smi 的 topology 或 fallback 查表
-        cuda_cores = _lookup_cuda_cores(gpu_name)
+        # 优先用 CuPy Runtime API 查询 SM 数 × 每 SM 核心数
+        # 比查 GPU 名称表更准确、兼容未来显卡
+        cuda_cores = _query_cuda_cores_via_cupy()
+        if cuda_cores == 0:
+            # CuPy 不可用时回退到 GPU 名称查表
+            cuda_cores = _lookup_cuda_cores(gpu_name)
 
         # NVENC 检测
         nvenc_count = gpu_count  # 每张卡 1 个 NVENC（现代显卡）
@@ -354,6 +357,57 @@ def _detect_nvidia() -> Optional[Dict[str, Any]]:
     except Exception:
         logger.exception("NVIDIA GPU 检测失败")
         return None
+
+
+# SM 核心数映射（按计算能力大版本，CUDA 规范保证永远稳定）
+_SM_CORES_BY_CC = {
+    (2, 0): 32,   # Fermi
+    (3, 0): 192,  # Kepler
+    (5, 0): 128,  # Maxwell
+    (6, 0): 64,   # Pascal (GP100)
+    (6, 1): 128,  # Pascal (GP10x)
+    (6, 2): 128,  # Pascal (GP10x)
+    (7, 0): 64,   # Volta
+    (7, 5): 64,   # Turing
+    (8, 0): 64,   # Ampere (A100)
+    (8, 6): 128,  # Ampere (GA10x)
+    (8, 7): 128,  # Ada Lovelace
+    (8, 9): 128,  # Ada Lovelace
+    (9, 0): 128,  # Blackwell
+}
+
+
+def _query_cuda_cores_via_cupy() -> int:
+    """通过 CuPy Runtime API 查询 SM 数 × 每 SM 核心数。
+
+    利用 cupy.cuda.runtime.getDeviceProperties 获取 SM 数量和计算能力，
+    再按 CC 版本映射到每 SM 核心数。比查 GPU 名称表更准确、兼容未来显卡。
+
+    Returns:
+        CUDA 核心数，失败返回 0
+    """
+    try:
+        import cupy as cp
+        props = cp.cuda.runtime.getDeviceProperties(0)
+        sm_count = props['multiProcessorCount']
+        major = props['major']
+        minor = props['minor']
+
+        # 精确匹配 CC 版本
+        key = (major, minor)
+        if key in _SM_CORES_BY_CC:
+            cores_per_sm = _SM_CORES_BY_CC[key]
+        else:
+            # 回退：按 major 版本找该系列最大已知值
+            fallback = max(
+                (v for (m, _), v in _SM_CORES_BY_CC.items() if m == major),
+                default=128,  # 现代架构最少 128
+            )
+            cores_per_sm = fallback
+
+        return sm_count * cores_per_sm
+    except Exception:
+        return 0
 
 
 def _lookup_cuda_cores(gpu_name: str) -> int:
