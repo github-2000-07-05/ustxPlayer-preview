@@ -3,7 +3,7 @@
 > [!TIP]
 > 本文档部分使用AI编写
 
-## v26h07 (2026-08-06) - 渲染导出重构与启动动画
+## v26h06 (2026-08-06) - 渲染导出重构与启动动画
 
 ---
 
@@ -29,19 +29,10 @@
 - **依赖调整**：`requirements.txt` 移除 numpy 等冗余依赖，新增 `cupy-cuda12x`（CUDA 渲染可选）、`pywin32`、`imageio-ffmpeg`。
 - **退出清理**：退出时先停止后台解析线程再清空缓存目录。
 
----
-
-## v26h06 (2026-08-05) - 导出功能封装为库与全面增强
-
----
-
-### 📦 导出功能封装为库（`export/`）
+### 📦 导出功能封装为库（`export/`，已并入本版渲染引擎）
 
 - **独立导出库**：导出相关代码从 `core/mp4_exporter.py` 与 `ui/export_*.py` 重构为自包含的 `export/` 库包（`options` / `ffmpeg_tools` / `exporter` / `error_log` / `setup_dialog` / `progress_dialog`），`main.py` 仅通过库的公共 API 调用，便于维护与复用。
 - **导出参数统一**：新增 `ExportOptions` 数据类统一承载宽高/帧率/码率/编码器/容器/颜色格式/是否混音等全部参数，并支持序列化持久化。
-
-### 🎛 导出设置对话框全面增强（`export/setup_dialog.py`）
-
 - **试验性功能警告**：对话框顶部醒目警告条，标注「导出为试验性功能」，提示如遇错误请在 GitHub Issues 提交错误日志。
 - **分辨率**：跟随屏幕 / 4K / 2K / 1080p / 720p / 480p / 360p（均标注像素尺寸）/ 自定义宽高。
 - **帧率**：预设 30 / 60 fps 快捷选择 + 自定义输入（默认 30fps，限制 1~120 并自动校验非法值）。
@@ -52,16 +43,10 @@
 - **颜色格式**：yuv420p（推荐）/ yuv422p / yuv444p。
 - **合并音频**：可勾选是否混入已关联音轨。
 - **上次参数记忆**：导出参数持久化到 Settings.ini，下次导出自动回填。
-
-### ⏯ 导出进度对话框增强（`export/progress_dialog.py`）
-
 - **开始/暂停/继续**：点击「开始」才真正启动导出线程；导出中可随时「暂停 / 继续」（线程在帧边界阻塞，安全）。
 - **取消**：导出中可取消，线程在帧边界响应。
 - **错误日志导出**：失败时显示错误详情，并可一键将 错误信息 + 导出参数 + ffmpeg 输出 写入 TXT 到用户指定目录，便于提交 Issues。
-
-### 🔧 其他
-
-- 旧文件 `core/mp4_exporter.py`、`ui/export_setup_dialog.py`、`ui/export_progress_dialog.py` 已删除，统一由 `export/` 库替代。
+- 旧文件 `core/mp4_exporter.py`、`ui/export_setup_dialog.py`、`ui/export_progress_dialog.py` 已删除。
 
 ---
 

@@ -37,7 +37,7 @@ from core.log import logger
 try:
     from main import APP_VERSION
 except ImportError:
-    APP_VERSION = "v26h07"
+    APP_VERSION = "v26h06"
 
 
 # ===================== 常量 =====================

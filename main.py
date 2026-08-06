@@ -2,7 +2,7 @@
 """提供侧边导航的现代化界面。"""
 
 # 软件版本号常量，所有文件引用此常量保证一致
-APP_VERSION = "v26h07"
+APP_VERSION = "v26h06"
 
 import os
 import sys
