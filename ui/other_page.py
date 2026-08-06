@@ -4,37 +4,46 @@
 import webbrowser
 from typing import Optional
 
-from PySide6.QtCore import Qt, QUrl
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QFrame
 from PySide6.QtGui import QColor
 
 from qfluentwidgets import (
     PushButton, BodyLabel, StrongBodyLabel, HorizontalSeparator,
     ComboBox, ColorPickerButton, HyperlinkButton,
-    InfoBar, InfoBarPosition,
+    InfoBar, InfoBarPosition, Theme, qconfig, themeColor,
 )
 
 from core.settings_manager import SettingsManager
+from ui.card_mixin import CardPageMixin
+
+try:
+    from main import APP_VERSION
+except ImportError:
+    APP_VERSION = "v26h06"
 
 
-class OtherPage(QWidget):
+class OtherPage(QWidget, CardPageMixin):
     """其他标签页 — 主题/快捷键/工具/关于软件。"""
+
+    _card_border_radius = 10
 
     def __init__(self, settings: SettingsManager, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self._s = settings
         self._setup_ui()
         self._connect_signals()
+        self._apply_card_theme()
 
     # ===================== UI 构建 =====================
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 20)
-        layout.setSpacing(12)
+        layout.setSpacing(8)
 
-        # ---- 主题设置 ----
-        layout.addWidget(StrongBodyLabel("/ 主题"))
+        # ---- 主题设置（卡片包裹） ----
+        theme_card, theme_layout = self._create_section_card("主题")
 
         theme_row = QHBoxLayout()
         theme_row.setSpacing(8)
@@ -43,9 +52,8 @@ class OtherPage(QWidget):
         self.theme_combo.addItems(["跟随系统", "亮色", "暗色"])
         theme_row.addWidget(self.theme_combo)
         theme_row.addStretch()
-        layout.addLayout(theme_row)
+        theme_layout.addLayout(theme_row)
 
-        # ---- 强调色设置 ----
         accent_mode_row = QHBoxLayout()
         accent_mode_row.setSpacing(8)
         accent_mode_row.addWidget(BodyLabel("强调色:"))
@@ -53,7 +61,7 @@ class OtherPage(QWidget):
         self.accent_color_mode_combo.addItems(["跟随系统", "自定义"])
         accent_mode_row.addWidget(self.accent_color_mode_combo)
         accent_mode_row.addStretch()
-        layout.addLayout(accent_mode_row)
+        theme_layout.addLayout(accent_mode_row)
 
         accent_custom_row = QHBoxLayout()
         accent_custom_row.setSpacing(8)
@@ -64,24 +72,25 @@ class OtherPage(QWidget):
         )
         accent_custom_row.addWidget(self.accent_color_picker)
         accent_custom_row.addStretch()
-        layout.addLayout(accent_custom_row)
+        theme_layout.addLayout(accent_custom_row)
 
-        layout.addWidget(HorizontalSeparator())
+        layout.addWidget(theme_card)
 
-        # ---- 快捷键说明 ----
-        layout.addWidget(StrongBodyLabel("/ 播放器快捷键"))
+        # ---- 播放器快捷键（卡片包裹） ----
+        shortcuts_card, shortcuts_layout = self._create_section_card("播放器快捷键")
+
         shortcuts_text = BodyLabel(
             "ESC : 退出\n"
             "空格 : 播放/暂停    X : 倍速-0.1    C : 倍速+0.1    Z : 还原1倍\n"
             "↑ ↓ : 系统音量    ← → : 快退/快进10秒"
         )
         shortcuts_text.setWordWrap(True)
-        layout.addWidget(shortcuts_text)
+        shortcuts_layout.addWidget(shortcuts_text)
 
-        layout.addWidget(HorizontalSeparator())
+        layout.addWidget(shortcuts_card)
 
-        # ---- 外部工具 ----
-        layout.addWidget(StrongBodyLabel("/ 外部工具"))
+        # ---- 外部工具（卡片包裹） ----
+        tool_card, tool_layout = self._create_section_card("外部工具")
 
         tool_row = QHBoxLayout()
         tool_row.setSpacing(12)
@@ -103,16 +112,16 @@ class OtherPage(QWidget):
         tool_row.addWidget(sig_btn)
 
         tool_row.addStretch()
-        layout.addLayout(tool_row)
+        tool_layout.addLayout(tool_row)
 
-        layout.addWidget(HorizontalSeparator())
+        layout.addWidget(tool_card)
 
-        # ---- 关于软件（含协议与许可）----
-        layout.addWidget(StrongBodyLabel("/ 关于软件"))
+        # ---- 关于软件（卡片包裹） ----
+        about_card, about_layout = self._create_section_card("关于软件")
 
         # 衍生项目说明
-        derive_label = BodyLabel("本项目（ustxPlayer）是基于 ustPlayer 的衍生项目")
-        layout.addWidget(derive_label)
+        derive_label = BodyLabel("本项目（ustxPlayer-preview）是基于 ustPlayer 的衍生项目")
+        about_layout.addWidget(derive_label)
 
         # 第一行：原项目 + GitHub仓库
         orig_row = QHBoxLayout()
@@ -126,37 +135,40 @@ class OtherPage(QWidget):
             "https://github.com/SYEternalR/ustPlayer", "GitHub仓库"
         ))
         orig_row.addStretch()
-        layout.addLayout(orig_row)
+        about_layout.addLayout(orig_row)
 
         # 第二行：本项目 + GitHub仓库
         proj_row = QHBoxLayout()
         proj_row.setSpacing(12)
         proj_row.addWidget(BodyLabel("本项目:"))
         proj_row.addWidget(HyperlinkButton(
-            "https://space.bilibili.com/1398756020", "ustxPlayer - v26g30 (c) 2026 SYEternal_R && 灰棱HiRenG && lyrinXD"
+            "https://space.bilibili.com/3546657897580911", f"ustxPlayer-preview - {APP_VERSION} (c) 2026 SYEternal_R && 灰棱HiRenG && lyrinXD"
         ))
         proj_row.addWidget(HyperlinkButton(
-            "https://github.com/lyrinXD/ustxPlayer", "GitHub仓库"
+            "https://github.com/github-2000-07-05/ustxPlayer-preview", "GitHub仓库"
         ))
         proj_row.addStretch()
-        layout.addLayout(proj_row)
+        about_layout.addLayout(proj_row)
 
-        # 最后一行：协议说明 + 使用协议（超链接样式，点击用系统默认程序打开）
+        # 最后一行：协议说明 + 两个协议按钮（GUI 内弹出对话框查看全文）
         lic_row = QHBoxLayout()
         lic_row.setSpacing(12)
-        lic_row.addWidget(BodyLabel("本项目沿用原项目的使用协议"))
-        lic_row.addWidget(HyperlinkButton(
-            QUrl.fromLocalFile(self._s.terms_file_path).toString(), "使用协议"
-        ))
+        lic_row.addWidget(BodyLabel("本项目使用 GNU LGPL v3.0 协议，并遵循上游使用协议："))
+        self.terms_btn = PushButton("上游使用协议")
+        self.terms_btn.clicked.connect(self._show_terms)
+        lic_row.addWidget(self.terms_btn)
+        self.license_btn = PushButton("GNU LGPL v3.0")
+        self.license_btn.clicked.connect(self._show_license)
+        lic_row.addWidget(self.license_btn)
         lic_row.addStretch()
-        layout.addLayout(lic_row)
-
-        layout.addWidget(HorizontalSeparator())
+        about_layout.addLayout(lic_row)
 
         # 彩蛋
-        easter = BodyLabel("你知道吗：alpha版本在提交至托管时曾被错误地命名为ustPlyaer。orz")
+        easter = BodyLabel("你知道吗：本项目是在ustxPlayer的基础上开发的")
         easter.setWordWrap(True)
-        layout.addWidget(easter)
+        about_layout.addWidget(easter)
+
+        layout.addWidget(about_card)
 
         layout.addStretch()
 
@@ -185,6 +197,12 @@ class OtherPage(QWidget):
 
         # 初始时根据模式显示/隐藏自定义颜色选择器
         self._update_accent_custom_visible(s.accent_color_mode)
+
+        # 主题变化时刷新卡片样式
+        try:
+            s.theme_mode_changed.connect(self._apply_card_theme)
+        except AttributeError:
+            pass
 
     # ===================== 业务逻辑 =====================
 
@@ -247,6 +265,26 @@ class OtherPage(QWidget):
         return {"跟随系统": "auto", "自定义": "custom"}.get(text, "auto")
 
     # ===================== 工具方法 =====================
+
+    def _show_terms(self):
+        """打开上游使用协议（Terms.txt），GUI 内查看。"""
+        from ui.license_dialog import LicenseDialog
+        dialog = LicenseDialog(
+            self.window(), title="ustPlayer 使用协议",
+            path=self._s.terms_file_path, encodings=["utf-8", "gbk"],
+            default_text="（未找到 Terms.txt 文件）",
+        )
+        dialog.exec()
+
+    def _show_license(self):
+        """打开 GNU LGPL v3.0 许可协议（LICENSE），GUI 内查看。"""
+        from ui.license_dialog import LicenseDialog
+        dialog = LicenseDialog(
+            self.window(), title="GNU LGPL v3.0 许可协议",
+            path=self._s.license_file_path, encodings=["utf-8", "gbk"],
+            default_text="（未找到 LICENSE 文件）",
+        )
+        dialog.exec()
 
     def _open_url(self, url: str):
         try:

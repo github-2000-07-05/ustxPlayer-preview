@@ -6,18 +6,19 @@ from typing import Optional
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
-    QHeaderView, QAbstractItemView,
+    QHeaderView, QAbstractItemView, QFrame,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QEvent
 from PySide6.QtGui import QColor, QKeyEvent, QFocusEvent
 
 from qfluentwidgets import (
     LineEdit, ComboBox,
     BodyLabel, StrongBodyLabel, HorizontalSeparator,
-    InfoBar, InfoBarPosition, PrimaryPushButton, themeColor,
+    InfoBar, InfoBarPosition, PrimaryPushButton, themeColor, Theme, qconfig,
 )
 
 from core.settings_manager import SettingsManager
+from ui.card_mixin import CardPageMixin
 
 
 # ===================== 自定义表格（拦截左右键） =====================
@@ -44,6 +45,7 @@ class _StyleTableWidget(QTableWidget):
         self.clearSelection()
         self.setCurrentCell(-1, -1)
         super().focusOutEvent(event)
+
 
 # MIDI 音高转换
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
@@ -77,8 +79,10 @@ def pitch_to_midi(text: str) -> int:
     return (octave + 1) * 12 + idx
 
 
-class LyricEditPage(QWidget):
+class LyricEditPage(QWidget, CardPageMixin):
     """歌词编辑标签页 — 批量筛选 + 表格逐音符编辑。"""
+
+    _card_border_radius = 10
 
     def __init__(self, settings: SettingsManager, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -91,16 +95,17 @@ class LyricEditPage(QWidget):
         self._syncing_styles = False  # 防止同步样式时信号循环
         self._setup_ui()
         self._connect_signals()
+        self._apply_card_theme()
 
     # ===================== UI 构建 =====================
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 20)
-        layout.setSpacing(10)
+        layout.setSpacing(12)
 
-        # ========== 批量编辑 ==========
-        layout.addWidget(StrongBodyLabel("/ 批量编辑"))
+        # ========== 批量编辑（卡片） ==========
+        batch_card, batch_layout = self._create_section_card("批量编辑")
 
         # 按序号筛选
         row_idx = QHBoxLayout()
@@ -116,7 +121,7 @@ class LyricEditPage(QWidget):
         self.filter_idx_end.setMaximumWidth(100)
         row_idx.addWidget(self.filter_idx_end)
         row_idx.addStretch()
-        layout.addLayout(row_idx)
+        batch_layout.addLayout(row_idx)
 
         # 按音高筛选
         row_pitch = QHBoxLayout()
@@ -132,7 +137,7 @@ class LyricEditPage(QWidget):
         self.filter_pitch_end.setMaximumWidth(100)
         row_pitch.addWidget(self.filter_pitch_end)
         row_pitch.addStretch()
-        layout.addLayout(row_pitch)
+        batch_layout.addLayout(row_pitch)
 
         # 批量设置样式
         row_style = QHBoxLayout()
@@ -144,26 +149,26 @@ class LyricEditPage(QWidget):
         self.batch_apply_btn = PrimaryPushButton("应用")
         row_style.addWidget(self.batch_apply_btn)
         row_style.addStretch()
-        layout.addLayout(row_style)
+        batch_layout.addLayout(row_style)
 
-        layout.addWidget(HorizontalSeparator())
+        layout.addWidget(batch_card)
 
-        # ========== 歌词编辑 ==========
-        layout.addWidget(StrongBodyLabel("/ 歌词编辑"))
+        # ========== 歌词编辑（卡片） ==========
+        lyric_card, lyric_layout = self._create_section_card("歌词编辑")
 
         # 规则说明
         rule_row = QHBoxLayout()
         rule_row.setSpacing(8)
         rule_row.addWidget(BodyLabel("静默和结尾时显示始终应用样式1"))
         rule_row.addStretch()
-        layout.addLayout(rule_row)
+        lyric_layout.addLayout(rule_row)
 
         # 操作提示
         hint_row = QHBoxLayout()
         hint_row.setSpacing(8)
         hint_row.addWidget(BodyLabel("提示: 选中单元格后，← → 切换样式，↑ ↓ 切换行"))
         hint_row.addStretch()
-        layout.addLayout(hint_row)
+        lyric_layout.addLayout(hint_row)
 
         # 表格（自定义子类拦截左右方向键）
         self.table = _StyleTableWidget()
@@ -183,7 +188,9 @@ class LyricEditPage(QWidget):
         # 设置左右键回调
         self.table.set_style_key_callback(self._on_style_key)
         self._apply_table_theme()
-        layout.addWidget(self.table, 1)
+        lyric_layout.addWidget(self.table, 1)
+
+        layout.addWidget(lyric_card)
 
     # ===================== 方向键切换样式 =====================
 
@@ -384,7 +391,8 @@ class LyricEditPage(QWidget):
         self._s.note_styles_changed.connect(self._on_note_styles_changed)
         # 选中单元格时用强调色高亮（不依赖 stylesheet）
         self.table.currentItemChanged.connect(self._on_selection_changed)
-        # 显式连接主题变更信号，解耦对 switchTo 隐式兜底的依赖
+        # 主题变化时刷新卡片样式和表格样式
+        self._s.theme_mode_changed.connect(self._apply_card_theme)
         self._s.theme_mode_changed.connect(self._apply_table_theme)
 
     def _on_notes_changed(self, notes: list):
@@ -479,18 +487,52 @@ class LyricEditPage(QWidget):
             self._syncing_styles = False
 
     def _apply_table_theme(self):
-        """根据当前主题设置表格样式，表格背景透明与界面融合。"""
-        from qfluentwidgets import qconfig, Theme
+        """根据当前主题设置表格样式，表格背景透明与卡片融合。"""
         is_dark = qconfig.theme == Theme.DARK
-        alt = "#252525" if is_dark else "#f0f0f0"
-        text = "#ffffff" if is_dark else "#000000"
+        if is_dark:
+            alt = "#2a2a2a"
+            text = "#e0e0e0"
+            header_bg = "#353535"
+            grid = "#3d3d3d"
+        else:
+            alt = "#f5f5f5"
+            text = "#333333"
+            header_bg = "#e8e8e8"
+            grid = "#e0e0e0"
+
         self.table.setStyleSheet(
-            f"QTableWidget {{ background: transparent; border: none; color: {text}; gridline-color: {alt}; }}"
-            f"QHeaderView::section {{ background: {alt}; color: {text}; padding: 4px; border: none; }}"
+            f"QTableWidget {{"
+            f"  background: transparent;"
+            f"  border: none;"
+            f"  color: {text};"
+            f"  gridline-color: {grid};"
+            f"  outline: none;"
+            f"}}"
+            f"QTableWidget::item {{"
+            f"  padding: 4px 8px;"
+            f"}}"
+            f"QTableWidget::item:selected {{"
+            f"  background: transparent;"
+            f"}}"
+            f"QHeaderView::section {{"
+            f"  background: {header_bg};"
+            f"  color: {text};"
+            f"  padding: 6px 4px;"
+            f"  border: none;"
+            f"  border-bottom: 1px solid {grid};"
+            f"  font-weight: 600;"
+            f"}}"
+            f"QHeaderView::section:first {{"
+            f"  border-top-left-radius: 6px;"
+            f"}}"
+            f"QHeaderView::section:last {{"
+            f"  border-top-right-radius: 6px;"
+            f"}}"
         )
 
     def sync_all_from_settings(self):
         """从 Settings 同步所有数据。"""
+        self._apply_card_theme()
         self._apply_table_theme()
         self._refresh_style_combo(self.batch_style_combo)
         self.table.clearSelection()

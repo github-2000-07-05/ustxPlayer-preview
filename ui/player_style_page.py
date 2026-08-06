@@ -5,7 +5,7 @@ import os
 from typing import Optional
 
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QFileDialog,
+    QWidget, QVBoxLayout, QHBoxLayout, QFileDialog, QFrame,
 )
 from PySide6.QtCore import Qt, QTimer, QSize
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QFontMetrics
@@ -13,12 +13,13 @@ from PySide6.QtGui import QColor, QFont, QFontDatabase, QFontMetrics
 from qfluentwidgets import (
     LineEdit, ComboBox, ColorPickerButton, PushButton, CheckBox,
     BodyLabel, StrongBodyLabel, HorizontalSeparator,
-    InfoBar, InfoBarPosition,
+    InfoBar, InfoBarPosition, Theme, qconfig, themeColor,
 )
 from qfluentwidgets.components.widgets.combo_box import ComboBoxMenu
 from qfluentwidgets.components.widgets.menu import MenuAnimationType
 
 from core.settings_manager import SettingsManager
+from ui.card_mixin import CardPageMixin
 
 # 样式对应的四个颜色键
 STYLE_COLOR_KEYS = ["bg_color", "note_color", "lyric_color", "pitch_curve_color"]
@@ -64,8 +65,10 @@ class _FontComboBox(ComboBox):
         return _FontComboMenu(self)
 
 
-class PlayerStylePage(QWidget):
+class PlayerStylePage(QWidget, CardPageMixin):
     """播放器样式标签页 — 颜色样式 + 全局背景 + 显示设置。"""
+
+    _card_border_radius = 10
 
     def __init__(self, settings: SettingsManager, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -76,16 +79,17 @@ class PlayerStylePage(QWidget):
         self._path_to_family: dict = {}  # 自定义字体路径→family 映射，避免重复 addApplicationFont
         self._setup_ui()
         self._connect_signals()
+        self._apply_card_theme()
 
     # ===================== UI 构建 =====================
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 20)
-        layout.setSpacing(10)
+        layout.setSpacing(8)
 
-        # ========== 全局背景 ==========
-        layout.addWidget(StrongBodyLabel("/ 全局背景"))
+        # ========== 全局背景（卡片包裹） ==========
+        bg_card, bg_layout = self._create_section_card("全局背景")
         row_global = QHBoxLayout()
         row_global.setSpacing(8)
         row_global.addWidget(BodyLabel("统一背景色:"))
@@ -101,11 +105,11 @@ class PlayerStylePage(QWidget):
         self.global_bg_check.setChecked(self._s.global_bg_enabled)
         row_global.addWidget(self.global_bg_check)
         row_global.addStretch()
-        layout.addLayout(row_global)
-        layout.addWidget(HorizontalSeparator())
+        bg_layout.addLayout(row_global)
+        layout.addWidget(bg_card)
 
-        # ========== 颜色样式 ==========
-        layout.addWidget(StrongBodyLabel("/ 颜色样式"))
+        # ========== 颜色样式（卡片包裹） ==========
+        style_card, style_layout = self._create_section_card("颜色样式")
 
         # 样式选择 + 新建按钮
         row_style = QHBoxLayout()
@@ -119,20 +123,20 @@ class PlayerStylePage(QWidget):
         self.delete_style_btn = PushButton("删除样式")
         row_style.addWidget(self.delete_style_btn)
         row_style.addStretch()
-        layout.addLayout(row_style)
+        style_layout.addLayout(row_style)
 
         # 当前样式的 4 个颜色编辑区
         for key in STYLE_COLOR_KEYS:
-            self._add_color_row(layout, STYLE_COLOR_LABELS[key], key)
+            self._add_color_row(style_layout, STYLE_COLOR_LABELS[key], key)
 
-        layout.addWidget(HorizontalSeparator())
+        layout.addWidget(style_card)
 
-        # ========== 显示设置 ==========
-        layout.addWidget(StrongBodyLabel("/ 显示设置"))
+        # ========== 显示设置（卡片包裹） ==========
+        display_card, display_layout = self._create_section_card("显示设置")
 
         # 逐字歌词字体（显示设置最上方，控制播放器中央大字）
         self._builtin_fonts = ["等线", "微软雅黑", "黑体", "得意黑"]
-        self.word_lyric_font_combo = self._add_font_row(layout, "逐字歌词字体:")
+        self.word_lyric_font_combo = self._add_font_row(display_layout, "逐字歌词字体:")
         self.word_lyric_font_combo.setCurrentText(self._s.word_lyric_font_family)
 
         # 歌词位置
@@ -144,30 +148,32 @@ class PlayerStylePage(QWidget):
         self.lyric_pos_combo.setCurrentText(self._s.lyric_pos)
         row_lyric.addWidget(self.lyric_pos_combo)
         row_lyric.addStretch()
-        layout.addLayout(row_lyric)
+        display_layout.addLayout(row_lyric)
 
         # 歌词及信息字体（歌词位置下方，控制 LRC 歌词、音名、BPM、时间、版权等）
-        self.info_font_combo = self._add_font_row(layout, "歌词及信息字体:")
+        self.info_font_combo = self._add_font_row(display_layout, "歌词及信息字体:")
         self.info_font_combo.setCurrentText(self._s.info_font_family)
 
         # 歌词及信息颜色（独立于样式，默认白色）
-        self._add_color_row(layout, "歌词及信息颜色:", "info_text_color")
+        self._add_color_row(display_layout, "歌词及信息颜色:", "info_text_color")
 
         self._add_combo_with_custom(
-            layout, "音高间占位符:", "pitch_placeholder",
+            display_layout, "音高间占位符:", "pitch_placeholder",
             ["无", "-", "自定义文字"],
             self._s.pitch_placeholder, "pitch_custom",
         )
         self._add_combo_with_custom(
-            layout, "静默时显示:", "silent_display",
+            display_layout, "静默时显示:", "silent_display",
             ["R", "♪", "-", "自定义文字", "什么都不显示"],
             self._s.silent_display, "silent_custom",
         )
         self._add_combo_with_custom(
-            layout, "结束时显示:", "end_display",
+            display_layout, "结束时显示:", "end_display",
             ["END", "-", "自定义文字", "什么都不显示"],
             self._s.end_display, "end_custom",
         )
+
+        layout.addWidget(display_card)
 
         layout.addStretch()
 
@@ -269,6 +275,12 @@ class PlayerStylePage(QWidget):
         # ---- Settings 数据变更 → UI 刷新 ----
         # 样式增删由 _on_new_style / _on_delete_style 单独处理，不在 styles_changed 全量刷新颜色字段
         s.active_style_index_changed.connect(self._on_active_style_changed_external)
+
+        # 主题变化时刷新卡片样式
+        try:
+            s.theme_mode_changed.connect(self._apply_card_theme)
+        except AttributeError:
+            pass
 
     def _bind_color_pair(self, edit, picker, setter):
         """通用颜色 Edit+Picker 双向绑定。

@@ -1,4 +1,4 @@
-# ustxplayer.py — 全屏播放器
+# ustxPlayer-preview.py — 全屏播放器
 """UST 音符可视化播放器，使用 QPainter 渲染全屏动画。"""
 
 import os
@@ -16,6 +16,12 @@ from PySide6.QtGui import (
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 
 from core.log import logger
+
+# 从 main.py 导入版本号
+try:
+    from main import APP_VERSION
+except ImportError:
+    APP_VERSION = "v26h06"
 
 
 # ===================== 工具函数 =====================
@@ -164,7 +170,7 @@ class NoteLyricDisplay(QWidget):
         self._info = ust_info
 
         # ---- 窗口配置 ----
-        self.setWindowTitle("ustxPlayer - Player")
+        self.setWindowTitle("ustxPlayer-preview - Player")
         self._fullscreen = ust_info["player_style"].get("fullscreen", True)
         # 窗口标志由 display() 在 show 前统一设置
 
@@ -745,7 +751,7 @@ class NoteLyricDisplay(QWidget):
             copy_c.setAlpha(self.copyright_alpha)
             painter.setPen(copy_c)
             painter.setFont(self.copyright_font)
-            copy_text = "ustxPlayer - v26g30 © 2026 SYEternalR"
+            copy_text = f"ustxPlayer-preview - {APP_VERSION} © 2026 SYEternalR"
             copy_w = self._fm_copyright.horizontalAdvance(copy_text)
             painter.drawText(ww // 2 - copy_w // 2, wh - 20, copy_text)
 

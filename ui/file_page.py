@@ -4,20 +4,21 @@
 import os
 
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QFileDialog, QDialog,
+    QWidget, QVBoxLayout, QHBoxLayout, QFileDialog, QDialog, QFrame,
 )
 from PySide6.QtCore import Qt, QThread, QTimer, Signal, QObject
 
 from qfluentwidgets import (
     LineEdit, PushButton, TextEdit, CheckBox,
     BodyLabel, StrongBodyLabel, HorizontalSeparator,
-    InfoBar, InfoBarPosition,
+    InfoBar, InfoBarPosition, Theme, qconfig, themeColor,
 )
 
 from core.settings_manager import SettingsManager
 from core.log import logger
 import core.ustxreader as ur
 from ui.track_select_dialog import TrackSelectDialog
+from ui.card_mixin import CardPageMixin
 
 
 # ===================== 后台解析工作线程 =====================
@@ -50,8 +51,10 @@ class _ParseWorker(QObject):
             self.failed.emit(str(e))
 
 
-class FilePage(QWidget):
+class FilePage(QWidget, CardPageMixin):
     """文件选择页面 - 支持 USTX 文件解析。"""
+
+    _card_border_radius = 10
 
     def __init__(self, settings: SettingsManager, parent=None):
         super().__init__(parent=parent)
@@ -62,14 +65,17 @@ class FilePage(QWidget):
         self._pending_notes: list | None = None  # 延迟写入的音符数据
         self._setup_ui()
         self._connect_signals()
+        self._apply_card_theme()
+
+    # ===================== UI 构建 =====================
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 20)
-        layout.setSpacing(10)
+        layout.setSpacing(8)
 
-        # ========== USTX 文件区 ==========
-        layout.addWidget(StrongBodyLabel("/ USTX 文件"))
+        # ========== USTX 文件区（卡片） ==========
+        ustx_card, ustx_layout = self._create_section_card("USTX 文件")
 
         ustx_row = QHBoxLayout()
         ustx_row.setSpacing(8)
@@ -79,16 +85,16 @@ class FilePage(QWidget):
         ustx_row.addWidget(self.ust_edit, 1)
         self.select_ust_btn = PushButton("选择 USTX")
         ustx_row.addWidget(self.select_ust_btn)
-        layout.addLayout(ustx_row)
+        ustx_layout.addLayout(ustx_row)
 
         self.cb_curve = CheckBox("显示音高线变化")
         self.cb_curve.setChecked(self._s.curve_show)
-        layout.addWidget(self.cb_curve)
+        ustx_layout.addWidget(self.cb_curve)
 
-        layout.addWidget(HorizontalSeparator())
+        layout.addWidget(ustx_card)
 
-        # ========== 音频文件区 ==========
-        layout.addWidget(StrongBodyLabel("/ 音频文件"))
+        # ========== 音频文件区（卡片） ==========
+        audio_card, audio_layout = self._create_section_card("音频文件")
 
         audio_row = QHBoxLayout()
         audio_row.setSpacing(8)
@@ -98,16 +104,16 @@ class FilePage(QWidget):
         audio_row.addWidget(self.audio_edit, 1)
         self.select_audio_btn = PushButton("选择音频")
         audio_row.addWidget(self.select_audio_btn)
-        layout.addLayout(audio_row)
+        audio_layout.addLayout(audio_row)
 
-        layout.addWidget(HorizontalSeparator())
+        layout.addWidget(audio_card)
 
-        # ========== 歌词文件区 ==========
-        layout.addWidget(StrongBodyLabel("/ 歌词文件"))
+        # ========== 歌词文件区（卡片） ==========
+        lyric_card, lyric_layout = self._create_section_card("歌词文件")
 
         self.cb_show_lyric = CheckBox("播放器中显示歌词")
         self.cb_show_lyric.setChecked(self._s.show_lyric)
-        layout.addWidget(self.cb_show_lyric)
+        lyric_layout.addWidget(self.cb_show_lyric)
 
         # 自动隐藏歌词
         autohide_row = QHBoxLayout()
@@ -122,7 +128,7 @@ class FilePage(QWidget):
         self.autohide_threshold_edit.setFixedWidth(50)
         autohide_row.addWidget(self.autohide_threshold_edit)
         autohide_row.addStretch()
-        layout.addLayout(autohide_row)
+        lyric_layout.addLayout(autohide_row)
 
         lrc_row = QHBoxLayout()
         lrc_row.setSpacing(8)
@@ -132,9 +138,9 @@ class FilePage(QWidget):
         lrc_row.addWidget(self.lyric_edit, 1)
         self.select_lyric_btn = PushButton("选择歌词")
         lrc_row.addWidget(self.select_lyric_btn)
-        layout.addLayout(lrc_row)
+        lyric_layout.addLayout(lrc_row)
 
-        layout.addWidget(HorizontalSeparator())
+        layout.addWidget(lyric_card)
 
         # ========== 操作按钮行 ==========
         action_row = QHBoxLayout()
@@ -145,13 +151,16 @@ class FilePage(QWidget):
         action_row.addStretch()
         layout.addLayout(action_row)
 
-        layout.addWidget(HorizontalSeparator())
+        # ========== 解析结果区（卡片） ==========
+        result_card, result_layout = self._create_section_card("解析结果")
 
-        # ========== 日志/检查结果输出 ==========
         self.result_edit = TextEdit()
         self.result_edit.setReadOnly(True)
         self.result_edit.setPlaceholderText("点击 [解析 USTX] 查看解析结果...")
-        layout.addWidget(self.result_edit)
+        self.result_edit.setMinimumHeight(200)
+        result_layout.addWidget(self.result_edit)
+
+        layout.addWidget(result_card)
 
     def _connect_signals(self):
         self.ust_edit.textChanged.connect(self._on_ust_path_changed)
@@ -184,6 +193,12 @@ class FilePage(QWidget):
 
         # 监听设置变化同步到 UI
         self._s.ustx_path_changed.connect(self._on_settings_ustx_changed)
+
+        # 主题变化时刷新卡片样式
+        try:
+            self._s.theme_mode_changed.connect(self._apply_card_theme)
+        except AttributeError:
+            pass
 
     def _on_settings_ustx_changed(self, path: str):
         """Settings 端路径变化时同步到 UI。"""

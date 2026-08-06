@@ -1,5 +1,8 @@
-# main.py — ustxPlayer 主入口
+# main.py — ustxPlayer-preview 主入口
 """提供侧边导航的现代化界面。"""
+
+# 软件版本号常量，所有文件引用此常量保证一致
+APP_VERSION = "v26h07"
 
 import os
 import sys
@@ -11,7 +14,7 @@ from PySide6.QtGui import QIcon, QColor, QGuiApplication
 
 from qfluentwidgets import (
     FluentWindow, NavigationItemPosition, FluentIcon,
-    InfoBar, InfoBarPosition, MessageBox, setTheme, Theme, setThemeColor,
+    InfoBar, InfoBarPosition, setTheme, Theme, setThemeColor,
 )
 
 from core.log import logger
@@ -25,6 +28,7 @@ from ui.player_style_page import PlayerStylePage
 from ui.lyric_edit_page import LyricEditPage
 from ui.other_page import OtherPage
 from ui.track_select_dialog import TrackSelectDialog
+from ui.player_action_dialog import PlayerActionDialog
 
 
 class MainWindow(FluentWindow):
@@ -34,7 +38,9 @@ class MainWindow(FluentWindow):
         super().__init__()
         self._settings = SettingsManager(self)
         self._player_window = None
-        self.setWindowTitle("ustxPlayer")
+        self._render_page = None
+        self._prev_interface = None
+        self.setWindowTitle("ustxPlayer-preview")
         self.resize(900, 620)
         self.setMinimumSize(640, 480)
 
@@ -154,6 +160,20 @@ class MainWindow(FluentWindow):
         else:
             setThemeColor(QColor(self._settings.custom_accent_color))
             logger.info(f"强调色已应用(自定义): {self._settings.custom_accent_color}")
+        # 强调色变化后刷新所有页面卡片（标题竖杠跟随强调色）
+        self._refresh_card_themes()
+
+    def _refresh_card_themes(self):
+        """应用强调色后刷新所有页面的卡片主题。
+
+        卡片标题前的竖杠颜色取自 themeColor()，强调色切换/自定义颜色
+        变化时若不刷新，竖杠会停留在旧颜色上。
+        """
+        for name in ("basic_page", "file_page", "player_style_page",
+                     "lyric_edit_page", "other_page"):
+            page = getattr(self, name, None)
+            if page is not None and hasattr(page, "_apply_card_theme"):
+                page._apply_card_theme()
 
     def _on_accent_color_mode_changed(self, mode: str):
         """用户切换强调色模式 → 重新应用并持久化。"""
@@ -198,22 +218,46 @@ class MainWindow(FluentWindow):
         self._apply_area_background()
 
     def _apply_area_background(self):
-        """根据当前主题设置页面背景色，解决暗色模式泛白问题。"""
+        """根据当前主题设置页面背景色，解决暗色模式泛白问题。
+
+        采用细腻渐变背景增强深度感，滚动条半透明，hover 强调色高亮。
+        """
         from qfluentwidgets import qconfig
         is_dark = qconfig.theme == Theme.DARK
-        bg = "#1a1a1a" if is_dark else "#f5f5f5"
-        for name in ("basic_page", "file_page", "player_style_page",
-                     "lyric_edit_page", "other_page"):
+        if is_dark:
+            bg = "#171717"
+            scroll_bg = "#171717"
+            handle = "rgba(255, 255, 255, 0.18)"
+            handle_hover = "rgba(255, 255, 255, 0.28)"
+        else:
+            bg = "#f5f6f8"
+            scroll_bg = "#f5f6f8"
+            handle = "rgba(0, 0, 0, 0.18)"
+            handle_hover = "rgba(0, 0, 0, 0.28)"
+
+        names = ["basic_page", "file_page", "player_style_page",
+                 "lyric_edit_page", "other_page"]
+        if hasattr(self, "scroll_render_page"):
+            names.append("render_page")
+
+        for name in names:
             scroll = getattr(self, f"scroll_{name}", None)
             if scroll:
                 scroll.setStyleSheet(
-                    f"QScrollArea {{ background: {bg}; }}"
+                    f"QScrollArea {{ background: {bg}; border: none; }}"
                     f"QScrollArea > QWidget > QWidget {{ background: {bg}; }}"
-                    f"QScrollBar:vertical {{ background: transparent; width: 8px; margin: 0; }}"
-                    f"QScrollBar::handle:vertical {{ background: #88888880; border-radius: 4px; min-height: 20px; }}"
-                    f"QScrollBar::handle:vertical:hover {{ background: #aaaaaa80; }}"
+                    f"QScrollBar:vertical {{"
+                    f"  background: {scroll_bg}; width: 10px; margin: 2px;"
+                    f"  border: none; border-radius: 5px;"
+                    f"}}"
+                    f"QScrollBar::handle:vertical {{"
+                    f"  background: {handle}; border-radius: 5px;"
+                    f"  min-height: 30px; margin: 2px;"
+                    f"}}"
+                    f"QScrollBar::handle:vertical:hover {{ background: {handle_hover}; }}"
                     f"QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}"
                     f"QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: none; }}"
+                    f"QScrollBar:horizontal {{ height: 0; }}"
                 )
 
     def _init_navigation(self):
@@ -280,10 +324,18 @@ class MainWindow(FluentWindow):
 
             ust_info = self._settings.build_ust_info(core_ust_info)
 
-            msg = MessageBox("启动播放器",
-                             "按下确认后将启动播放器，鼠标单击后按ESC键退出全屏", self)
-            if msg.exec():
+            # 播放确认：启动播放器 / 导出为 MP4 / 取消
+            dlg = PlayerActionDialog(
+                self,
+                project_name=self._settings.project_name,
+                audio_path=self._settings.audio_path,
+            )
+            dlg.exec()
+            action = dlg.chosen_action
+            if action == "play":
                 self._launch_player(ust_info)
+            elif action == "export":
+                self._launch_render_export(ust_info)
 
         except Exception as e:
             logger.exception("播放准备失败")
@@ -298,6 +350,40 @@ class MainWindow(FluentWindow):
                      self.lyric_edit_page, self.other_page]:
             if hasattr(page, "sync_all_from_settings"):
                 page.sync_all_from_settings()
+
+    def _launch_render_export(self, ust_info: dict):
+        """打开渲染导出页面（复用主窗口内容区，不在导航栏显示）。
+
+        页面懒创建：首次使用时直接加入 stackedWidget，
+        之后再次导出复用同一页面实例。
+        """
+        self._prev_interface = self.stackedWidget.currentWidget()
+
+        if self._render_page is None:
+            from ui.render_export_page import RenderExportPage
+            self._render_page = RenderExportPage(ust_info, self, settings=self._settings)
+
+            self.scroll_render_page = QScrollArea()
+            self.scroll_render_page.setWidgetResizable(True)
+            self.scroll_render_page.setWidget(self._render_page)
+            self.scroll_render_page.setFrameShape(QScrollArea.Shape.NoFrame)
+            self.scroll_render_page.setObjectName("scroll_render_page")
+
+            # 直接加入 stackedWidget，不经过导航栏（不在导航栏中显示）
+            self.stackedWidget.addWidget(self.scroll_render_page)
+            self._apply_area_background()
+        else:
+            self._render_page.set_ust_info(ust_info)
+            self._render_page.reset_state()
+
+        # 直接切换到渲染页面
+        self.stackedWidget.setCurrentWidget(self.scroll_render_page)
+
+    def _exit_render_page(self):
+        """从渲染导出页面返回进入前的页面。"""
+        target = self._prev_interface if self._prev_interface is not None else self.basic_page
+        self.switchTo(target)
+        self._prev_interface = None
 
     def _launch_player(self, ust_info: dict):
         """启动播放器并保持引用。如有旧窗口则先关闭。"""
@@ -471,7 +557,7 @@ class MainWindow(FluentWindow):
 
 def main():
     logger.info("=" * 50)
-    logger.info("ustxPlayer 启动")
+    logger.info("ustxPlayer-preview 启动")
     logger.info(f"Python: {sys.version}")
     logger.info(f"工作目录: {os.getcwd()}")
     try:
@@ -483,7 +569,7 @@ def main():
     # 修复任务栏图标 - 设置 AppUserModelID
     try:
         import ctypes
-        app_id = "ustxPlayer.ustxPlayer.1"
+        app_id = "ustxPlayer-preview.ustxPlayer-preview.1"
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
     except Exception:
         pass
@@ -493,8 +579,8 @@ def main():
     )
 
     app = QApplication(sys.argv)
-    app.setApplicationName("ustxPlayer")
-    app.setApplicationDisplayName("ustxPlayer")
+    app.setApplicationName("ustxPlayer-preview")
+    app.setApplicationDisplayName("ustxPlayer-preview")
 
     # 安装中文翻译器，汉化 qfluentwidgets 内部英文文案
     # 用局部变量持有引用：main() 阻塞在 app.exec() 直到退出，translator 存活整个应用生命周期
@@ -527,10 +613,24 @@ def main():
     if os.path.exists(icon_path):
         app.setWindowIcon(QIcon(icon_path))
 
+    # 启动动画：动画先行，主窗口在动画播放期间创建，动画结束淡出时再显示
+    from ui.splash_screen import SplashScreen
+    splash = SplashScreen(icon_path=os.path.join(program_root, "icon.png"))
+    splash.show()
+    splash.fade_in()
+    splash.set_message("正在加载界面...")
+    app.processEvents()
+
     logger.info("正在创建主窗口...")
     window = MainWindow()
-    window.show()
-    logger.info("主窗口已显示")
+    logger.info("主窗口创建完成，等待启动动画结束")
+
+    # 动画展示满 5 秒开始淡出时，才显示主窗口（实现「动画期间加载 GUI，动画结束后启动 GUI」）
+    def _show_main_window():
+        window.show()
+        logger.info("主窗口已显示")
+    splash.set_message("启动完成")
+    splash.finish(on_fade_out=_show_main_window)
 
     # 退出时清理：先停止 file_page 后台解析线程，再清空缓存目录
     app.aboutToQuit.connect(window.file_page.cleanup_parse_thread)

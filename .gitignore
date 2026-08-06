@@ -228,3 +228,12 @@ cache/
 
 # 旧版参考副本，不参与构建与分析
 原项目/
+
+# 日志目录
+log/
+
+# 渲染临时目录
+temp_render/
+
+# Nuitka 崩溃报告
+nuitka-crash-report.xml

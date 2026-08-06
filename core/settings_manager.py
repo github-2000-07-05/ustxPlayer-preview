@@ -170,6 +170,7 @@ class SettingsManager(QObject):
 
         # 文本文件路径
         self.terms_file_path = os.path.join(self.program_root, "Terms.txt")
+        self.license_file_path = os.path.join(self.program_root, "LICENSE")
 
         # 缓存目录（程序根目录下，存放 ustx 等还原缓存）
         # 启动与退出时各清空一次（仅删除本程序创建的 ustx_cache_* 文件）：
@@ -962,7 +963,7 @@ class SettingsManager(QObject):
             settings_data["project_name"] = "未命名"
 
         payload = {
-            "format": "ustxPlayer.uplr",
+            "format": "ustxPlayer-preview.uplr",
             "version": 2,
             "ustx_content": ustx_content,
             "settings": settings_data,
@@ -995,8 +996,8 @@ class SettingsManager(QObject):
             payload = json.load(f)
 
         # 校验工程文件格式，避免误导入任意 JSON 污染当前配置
-        if payload.get("format") != "ustxPlayer.uplr" or payload.get("version") != 2:
-            raise ValueError("不是有效的 ustxPlayer 工程文件（format/version 不匹配）")
+        if payload.get("format") != "ustxPlayer-preview.uplr" or payload.get("version") != 2:
+            raise ValueError("不是有效的 ustxPlayer-preview 工程文件（format/version 不匹配）")
 
         data = payload.get("settings", {})
         ustx_content = payload.get("ustx_content", "") or ""

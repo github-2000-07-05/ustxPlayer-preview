@@ -6,21 +6,24 @@ from typing import Optional, Callable
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QFileDialog,
+    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFileDialog, QFrame,
 )
 
 from qfluentwidgets import (
     LineEdit, PushButton, PrimaryPushButton, SwitchButton,
     BodyLabel, StrongBodyLabel, HorizontalSeparator,
-    InfoBar, InfoBarPosition,
+    InfoBar, InfoBarPosition, Theme, qconfig, themeColor,
 )
 
 from core.log import logger
 from core.settings_manager import SettingsManager, ProjectFileMissingError
+from ui.card_mixin import CardPageMixin
 
 
-class BasicPage(QWidget):
+class BasicPage(QWidget, CardPageMixin):
     """基础页 — 项目信息 + 显示选项 + Play。"""
+
+    _card_border_radius = 10
 
     def __init__(self, settings: SettingsManager, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -39,6 +42,7 @@ class BasicPage(QWidget):
         self.sw_show_copyright: SwitchButton
         self._setup_ui()
         self._connect_signals()
+        self._apply_card_theme()
 
     def set_play_callback(self, callback: Callable):
         self._play_callback = callback
@@ -61,42 +65,42 @@ class BasicPage(QWidget):
         layout.addLayout(btn_row)
         layout.addWidget(HorizontalSeparator())
 
-        # ---- 关于项目 ----
-        self._add_section_title(layout, "/ 关于项目")
-        self._add_field(layout, "项目名：", "project_name")
-        self._add_field(layout, "曲名&曲师：", "song_name")
-        self._add_field(layout, "MIDI作者：", "song_author")
-        self._add_field(layout, "调音师：", "ust_author")
-        layout.addWidget(HorizontalSeparator())
+        # ---- 关于项目（卡片包裹） ----
+        project_card, project_layout = self._create_section_card("关于项目")
+        self._add_field(project_layout, "项目名：", "project_name")
+        self._add_field(project_layout, "曲名&曲师：", "song_name")
+        self._add_field(project_layout, "MIDI作者：", "song_author")
+        self._add_field(project_layout, "调音师：", "ust_author")
+        layout.addWidget(project_card)
 
-        # ---- 显示选项（Switch 双列网格） ----
-        self._add_section_title(layout, "/ 显示选项")
+        # ---- 显示选项（卡片包裹，双列网格） ----
+        display_card, display_layout = self._create_section_card("显示选项")
         switches = [
-            ("显示BPM",     "show_bpm"),
-            ("显示播放时间", "show_play_time"),
-            ("显示曲目信息", "show_song_name"),
-            ("显示MIDI作者", "show_song_author"),
-            ("显示调音师",   "show_ust_author"),
+            ("显示BPM",         "show_bpm"),
+            ("显示播放时间",     "show_play_time"),
+            ("显示曲目信息",     "show_song_name"),
+            ("显示MIDI作者",     "show_song_author"),
+            ("显示调音师",       "show_ust_author"),
             ("显示软件版权信息", "show_copyright"),
         ]
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(4)
         cols = 2
-        for i in range(0, len(switches), cols):
-            row = QHBoxLayout()
-            row.setSpacing(0)
-            batch = switches[i:i + cols]
-            for label, attr in batch:
-                cell = QHBoxLayout()
-                cell.setContentsMargins(0, 2, 0, 2)
-                sw = SwitchButton()
-                cell.addWidget(sw)
-                cell.addWidget(BodyLabel(label))
-                cell.addStretch()
-                row.addLayout(cell)
-                setattr(self, f"sw_{attr}", sw)
-            # 补空列保持对齐
-            for _ in range(cols - len(batch)):
-                row.addStretch(1)
-            layout.addLayout(row)
+        for idx, (label, attr) in enumerate(switches):
+            row_idx = idx // cols
+            col_idx = idx % cols
+            cell = QHBoxLayout()
+            cell.setContentsMargins(0, 4, 0, 4)
+            cell.setSpacing(8)
+            sw = SwitchButton()
+            cell.addWidget(sw)
+            cell.addWidget(BodyLabel(label))
+            cell.addStretch()
+            grid.addLayout(cell, row_idx, col_idx)
+            setattr(self, f"sw_{attr}", sw)
+        display_layout.addLayout(grid)
+        layout.addWidget(display_card)
 
         layout.addStretch()
 
@@ -104,11 +108,6 @@ class BasicPage(QWidget):
         self.play_btn = PrimaryPushButton("播放 Play")
         self.play_btn.setMinimumHeight(40)
         layout.addWidget(self.play_btn)
-
-    def _add_section_title(self, parent: QVBoxLayout, text: str):
-        lbl = StrongBodyLabel(text)
-        lbl.setContentsMargins(0, 4, 0, 2)
-        parent.addWidget(lbl)
 
     def _add_field(self, parent_layout: QVBoxLayout, label: str, attr: str):
         row = QHBoxLayout()
@@ -156,12 +155,18 @@ class BasicPage(QWidget):
         self.export_btn.clicked.connect(self._on_export)
         self.play_btn.clicked.connect(self._on_play)
 
+        # 主题变化时刷新卡片样式
+        try:
+            s.theme_mode_changed.connect(self._apply_card_theme)
+        except AttributeError:
+            pass
+
     # ===================== 业务逻辑 =====================
 
     def _on_import(self):
         file_path, _ = QFileDialog.getOpenFileName(
             self, "打开工程文件", self._s.last_open_dir,
-            "ustxPlayer工程文件 (*.uplr);;所有文件 (*.*)",
+            "ustxPlayer-preview工程文件 (*.uplr);;所有文件 (*.*)",
         )
         if not file_path:
             return
@@ -189,7 +194,7 @@ class BasicPage(QWidget):
         file_path, _ = QFileDialog.getSaveFileName(
             self, "导出你的工程文件",
             os.path.join(self._s.last_export_dir, self._s.project_name or "未命名"),
-            "ustxPlayer工程文件 (*.uplr);;所有文件 (*.*)",
+            "ustxPlayer-preview工程文件 (*.uplr);;所有文件 (*.*)",
         )
         if not file_path:
             return

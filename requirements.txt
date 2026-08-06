@@ -27,6 +27,11 @@ PyYAML>=6.0
 #   win32api, win32gui, win32print（用于无边框窗口的 Windows 原生窗口管理）
 pywin32>=305
 
+# CUDA 加速 — GPU 渲染导出（NVIDIA 显卡可选）
+#   需要 NVIDIA 显卡 + CUDA 驱动；无 NVIDIA 显卡可跳过此依赖
+#   [ctk] 额外安装 CUDA toolkit headers，CuPy JIT 编译 kernel 需要
+cupy-cuda12x[ctk]>=14.0
+
 
 # ==================== 标准库 (无需安装) ====================
 # os, sys, re, time, json, copy, hashlib, shutil, ctypes, winreg, webbrowser

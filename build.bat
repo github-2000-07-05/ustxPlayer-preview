@@ -7,7 +7,7 @@ REM Usage:
 REM   1. Run: build.bat
 REM      (Nuitka and C compiler will be auto-resolved)
 REM
-REM Output: dist\ustxPlayer.dist\ustxPlayer.exe
+REM Output: dist\ustxPlayer.exe
 REM ============================================================
 
 setlocal
@@ -15,7 +15,7 @@ setlocal
 REM Auto-detect Python - try py launcher first, fall back to PATH
 where py >nul 2>&1
 if not errorlevel 1 (
-    set PYTHON=py -3.12
+    set PYTHON=python
 ) else (
     set PYTHON=python
 )
@@ -53,6 +53,18 @@ echo   Plugins:  %MM_PLUGINS%
 echo   PySide6:  %PYSIDE6_DIR%
 echo.
 
+REM Locate imageio-ffmpeg bundled ffmpeg (used for MP4 export)
+for /f "delims=" %%i in ('%PYTHON% -c "import imageio_ffmpeg;print(imageio_ffmpeg.get_ffmpeg_exe())"') do set FFMPEG_EXE=%%i
+if not exist "%FFMPEG_EXE%" (
+    echo ERROR: imageio-ffmpeg binary not found!
+    echo   Looked for: %FFMPEG_EXE%
+    echo   MP4 export will NOT work. Make sure it is installed: pip install imageio-ffmpeg
+    pause
+    exit /b 1
+)
+echo   ffmpeg:   %FFMPEG_EXE%
+echo.
+
 echo [3/3] Starting compilation (first run may take 10-20 mins)...
 echo.
 
@@ -60,18 +72,22 @@ REM Build command
 REM Exclude large unused deps pulled in transitively by qfluentwidgets[full]:
 REM   scipy / pandas / matplotlib / sklearn / PIL / numpy / pytest / PyInstaller
 %PYTHON% -m nuitka ^
-    --standalone ^
+    --onefile ^
+    --disable-cache=all ^
     --enable-plugin=pyside6 ^
     --include-package=qfluentwidgets ^
     --include-package-data=qfluentwidgets ^
     --include-package=qframelesswindow ^
     --include-package-data=qframelesswindow ^
     --include-package=yaml ^
+    --include-package=imageio_ffmpeg ^
     --include-package=win32api ^
     --include-package=win32gui ^
     --include-package=win32print ^
     --include-data-files="icon.ico=icon.ico" ^
     --include-data-files="Terms.txt=Terms.txt" ^
+    --include-data-files="LICENSE=LICENSE" ^
+    --include-data-files="%FFMPEG_EXE%=ffmpeg.exe" ^
     --include-data-files="%MM_PLUGINS%\ffmpegmediaplugin.dll=PySide6/qt-plugins/multimedia/ffmpegmediaplugin.dll" ^
     --include-data-files="%MM_PLUGINS%\windowsmediaplugin.dll=PySide6/qt-plugins/multimedia/windowsmediaplugin.dll" ^
     --include-data-files="%PYSIDE6_DIR%\avcodec-61.dll=avcodec-61.dll" ^
@@ -158,16 +174,6 @@ echo ============================================================
 echo  Build successful!
 echo ============================================================
 echo.
-
-REM Rename dist directory from main.dist to ustxPlayer.dist
-if exist "dist\main.dist" (
-    if exist "dist\ustxPlayer.dist" (
-        rmdir /s /q "dist\ustxPlayer.dist"
-    )
-    rename "dist\main.dist" ustxPlayer.dist
-)
-
-echo  Output: dist\ustxPlayer.dist\
-echo  Binary: dist\ustxPlayer.dist\ustxPlayer.exe
+echo  Output: dist\ustxPlayer.exe
 echo.
 pause
