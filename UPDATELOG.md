@@ -3,6 +3,37 @@
 > [!TIP]
 > 本文档部分使用AI编写
 
+## v26h07 (2026-08-07) - 零磁盘渲染管道与渲染引擎优化
+
+---
+
+### 零磁盘 I/O 渲染管道
+
+- **内存管道传输**：渲染管线全面移除磁盘 I/O，帧数据通过内存缓冲区 + FFmpeg rawvideo stdin 管道直接投喂编码器，不再写入 BMP 临时文件（`_render_chunk_memory` + `_encode_video_pipe`）。
+- **移除旧磁盘流**：删除保存线程池、BMP 写入、concat 文件生成、双 NVENC 分段编码等磁盘相关代码，管线精简约 300 行。
+- **临时文件消除**：渲染过程不再创建 `temp_dir`，唯一临时产物 `video_only.mp4` 由编码函数内部管理并在 mux 后自动清理。
+
+### 渲染引擎优化
+
+- **CUDA 核心数检测修复**：从 GPU 名称查表改为通过 CuPy Runtime API / CUDA Driver API 直接查询 SM 数量 × 每 SM 核心数，兼容未来显卡（`_query_cuda_cores_via_cupy` / `_query_cuda_cores_via_cuda_driver`）。
+- **分层渲染架构**：静态叠加层（曲名、作曲、BPM、版权）预渲染为透明 QImage 并上传 GPU 显存，所有帧复用，避免重复绘制（`_render_static_overlay` + `_OVERLAY_CUDA`）。
+- **OpenGL 渲染后端**：新增 OpenGL 渲染后端，无需 CuPy 即可 GPU 加速，AMD/Intel 显卡开箱即用（`_render_frame_opengl`）。
+- **自动模式显示实际后端**：UI 在自动模式下显示实际选中的渲染后端（CUDA / OpenGL / CPU）。
+- **编码参数优化**：NVENC 预设 p4 → p1，码率上限 20M，移除冗余 fps 滤镜，编码速度显著提升。
+
+### 音高曲线绘制修复
+
+- **宽度缩放修复**：`curve_width` 不再直接用 tick 单位作为像素宽度，改为按分辨率缩放（最小 96px，最多半屏宽）。
+- **线宽算法修复**：`_cuda_draw_polyline` 移除三层嵌套 Python 循环，改用 numpy broadcasting 向量化展开线宽。
+
+### 其他
+
+- **常量定义集中**：所有常量统一移到文件头部。
+- **临时文件管理**：使用系统临时目录而非程序目录。
+- **项目名统一**：原项目引用 `ustPlayer` → `ustxPlayer`，README 和更新日志同步更新。
+
+---
+
 ## v26h06 (2026-08-06) - 渲染导出重构与启动动画
 
 ---
@@ -103,7 +134,7 @@
 
 ## v26h05 (2026-07-30) — ustxPlayer 二次开发版
 
-基于 [ustPlayer](https://github.com/SYEternalR/ustPlayer) v26f19 的二次开发版本。核心工程格式从 UST 全面转向 USTX，并新增样式系统、多语言 LRC 歌词、音频同步播放、界面主题定制等功能。
+基于 [ustxPlayer](https://github.com/SYEternalR/ustxPlayer) v26f19 的二次开发版本。核心工程格式从 UST 全面转向 USTX，并新增样式系统、多语言 LRC 歌词、音频同步播放、界面主题定制等功能。
 
 ---
 
@@ -118,7 +149,7 @@
 
 ### 📦 工程文件系统重构（不兼容旧版）
 
-- **格式版本升级**：`.uplr` 工程文件采用全新格式（`format: "ustxPlayer.uplr"`，`version: 2`），**不兼容旧版 ustPlayer 的 `.uplr` 文件**，导入旧版文件会被拒绝并提示格式不匹配。
+- **格式版本升级**：`.uplr` 工程文件采用全新格式（`format: "ustxPlayer.uplr"`，`version: 2`），**不兼容旧版 ustxPlayer 的 `.uplr` 文件**，导入旧版文件会被拒绝并提示格式不匹配。
 - **内嵌 USTX 内容**：导出时将 `.ustx` 工程文件全文以 `ustx_content` 字段内嵌于 `.uplr` 中，使其成为独立完整的工程文件，分发时无需额外携带 `.ustx` 文件。
 - **缓存释放机制**：导入 `.uplr` 时将内嵌的 USTX 内容释放到程序目录下的 `cache/` 子目录并重新解析得到音符数据；程序启动与退出时各清空一次 `cache/`，确保干净状态并避免残留。
 
@@ -208,7 +239,7 @@ ustxPlayer/
 │   └── other_page.py           # 其他 — 主题、快捷键、外部工具、关于软件
 ```
 
-> 相比 ustPlayer v26f19，核心解析器从 `ustreader.py` 迁移至 `ustxreader.py`，播放器从 `ustplayer.py` 重构为 `ustxplayer.py`，并新增 `lyric_edit_page.py` 与 `i18n.py` 以支持样式系统与界面汉化。
+> 相比 ustxPlayer v26f19，核心解析器从 `ustreader.py` 迁移至 `ustxreader.py`，播放器从 `ustplayer.py` 重构为 `ustxplayer.py`，并新增 `lyric_edit_page.py` 与 `i18n.py` 以支持样式系统与界面汉化。
 
 ---
 
@@ -232,7 +263,7 @@ PyYAML >= 6.0
 
 ## v26f19 (2026-06-19) — 全新 PySide6 现代化重制版
 
-ustPlayer 从 tkinter 全面迁移至 PySide6 + Fluent Design，带来现代化的界面体验和更好的性能表现。
+ustxPlayer 从 tkinter 全面迁移至 PySide6 + Fluent Design，带来现代化的界面体验和更好的性能表现。
 
 ---
 

@@ -20,7 +20,7 @@ from ui.card_mixin import CardPageMixin
 try:
     from main import APP_VERSION
 except ImportError:
-    APP_VERSION = "v26h06"
+    APP_VERSION = "v26h07"
 
 
 class OtherPage(QWidget, CardPageMixin):
@@ -120,7 +120,7 @@ class OtherPage(QWidget, CardPageMixin):
         about_card, about_layout = self._create_section_card("关于软件")
 
         # 衍生项目说明
-        derive_label = BodyLabel("本项目（ustxPlayer-preview）是基于 ustPlayer 的衍生项目")
+        derive_label = BodyLabel("本项目（ustxPlayer-preview）是基于 ustxPlayer 的衍生项目")
         about_layout.addWidget(derive_label)
 
         # 第一行：原项目 + GitHub仓库
@@ -129,10 +129,10 @@ class OtherPage(QWidget, CardPageMixin):
         orig_row.addWidget(BodyLabel("原项目:"))
         orig_row.addWidget(HyperlinkButton(
             "https://space.bilibili.com/661930756",
-            "ustPlayer - v26f19 (c) 2026 SYEternal_R && 灰棱HiRenG"
+            "ustxPlayer - v26f19 (c) 2026 SYEternal_R && 灰棱HiRenG"
         ))
         orig_row.addWidget(HyperlinkButton(
-            "https://github.com/SYEternalR/ustPlayer", "GitHub仓库"
+            "https://github.com/SYEternalR/ustxPlayer", "GitHub仓库"
         ))
         orig_row.addStretch()
         about_layout.addLayout(orig_row)
@@ -270,7 +270,7 @@ class OtherPage(QWidget, CardPageMixin):
         """打开上游使用协议（Terms.txt），GUI 内查看。"""
         from ui.license_dialog import LicenseDialog
         dialog = LicenseDialog(
-            self.window(), title="ustPlayer 使用协议",
+            self.window(), title="ustxPlayer 使用协议",
             path=self._s.terms_file_path, encodings=["utf-8", "gbk"],
             default_text="（未找到 Terms.txt 文件）",
         )
