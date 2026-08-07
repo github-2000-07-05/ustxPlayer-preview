@@ -307,7 +307,7 @@ def _detect_nvidia() -> Optional[Dict[str, Any]]:
 
     使用 nvidia-smi 查询:
       - GPU 名称
-      - CUDA 核心数（通过子进程解析或查找表）
+      - CUDA 核心数（通过 CuPy/CUDA Driver API 实时计算）
       - 显存总量/空余
       - NVENC 数量/代数
     """
@@ -336,8 +336,8 @@ def _detect_nvidia() -> Optional[Dict[str, Any]]:
         # 比查 GPU 名称表更准确、兼容未来显卡
         cuda_cores = _query_cuda_cores_via_cupy()
         if cuda_cores == 0:
-            # CuPy 不可用时回退到 GPU 名称查表
-            cuda_cores = _lookup_cuda_cores(gpu_name)
+            # CuPy 不可用时，用 CUDA Driver API 直接查询
+            cuda_cores = _query_cuda_cores_via_cuda_driver()
 
         # NVENC 检测
         nvenc_count = gpu_count  # 每张卡 1 个 NVENC（现代显卡）
@@ -410,53 +410,72 @@ def _query_cuda_cores_via_cupy() -> int:
         return 0
 
 
-def _lookup_cuda_cores(gpu_name: str) -> int:
-    """通过 GPU 名称查找 CUDA 核心数（查找表 + 正则匹配 fallback）。"""
-    # 常见 GPU CUDA 核心查找表
-    lookup = {
-        # RTX 50 series (Blackwell)
-        "RTX 5090": 21760, "RTX 5080": 10752, "RTX 5070 Ti": 8960,
-        "RTX 5070": 6144, "RTX 5060 Ti": 4608, "RTX 5060": 4096,
-        # RTX 40 series (Ada Lovelace)
-        "RTX 4090": 16384, "RTX 4080": 9728, "RTX 4070 Ti": 7680,
-        "RTX 4070": 5888, "RTX 4060 Ti": 4352, "RTX 4060": 3072,
-        # RTX 30 series (Ampere)
-        "RTX 3090": 10496, "RTX 3080 Ti": 10240, "RTX 3080": 8704,
-        "RTX 3070 Ti": 6144, "RTX 3070": 5888, "RTX 3060 Ti": 4864,
-        "RTX 3060": 3584, "RTX 3050": 2560,
-        # RTX 20 series (Turing)
-        "RTX 2080 Ti": 4352, "RTX 2080": 2944, "RTX 2070": 2304,
-        "RTX 2060": 1920, "RTX 2050": 2048,
-        # GTX 16 series (Turing)
-        "GTX 1660 Ti": 1536, "GTX 1660": 1408, "GTX 1650": 896,
-        # GTX 10 series (Pascal)
-        "GTX 1080 Ti": 3584, "GTX 1080": 2560, "GTX 1070": 1920,
-        "GTX 1060": 1280, "GTX 1050 Ti": 768, "GTX 1050": 640,
-        # Quadro / Workstation
-        "RTX A6000": 10752, "RTX A5000": 8192, "RTX A4000": 6144,
-        "RTX A2000": 3328, "A100": 6912, "A40": 10752,
-        "RTX 6000 Ada": 18176, "RTX 5000 Ada": 12800,
-        "RTX 4000 Ada": 6144,
-    }
+def _query_cuda_cores_via_cuda_driver() -> int:
+    """通过 CUDA Driver API 直接查询 SM 数量 × 每 SM 核心数。
 
-    # 精确匹配
-    name_upper = gpu_name.upper()
-    for key, cores in lookup.items():
-        if key.upper() in name_upper:
-            return cores
+    无需 CuPy 依赖，直接调用 nvcuda.dll / libcuda.so。
+    比 GPU 名称查表更准确、兼容未来显卡。
 
-    # 按架构推测
-    if "RTX 50" in name_upper or "BLACKWELL" in name_upper:
-        return 8000
-    if "RTX 40" in name_upper or "ADA" in name_upper:
-        return 6000
-    if "RTX 30" in name_upper or "AMPERE" in name_upper:
-        return 4000
-    if "RTX 20" in name_upper or "TURING" in name_upper or "GTX 16" in name_upper:
-        return 2000
-    if "GTX 10" in name_upper or "PASCAL" in name_upper:
-        return 1500
-    return 0
+    Returns:
+        CUDA 核心数，失败返回 0
+    """
+    try:
+        import ctypes
+        import sys
+
+        if sys.platform == 'win32':
+            lib = ctypes.CDLL('nvcuda.dll')
+        else:
+            lib = ctypes.CDLL('libcuda.so.1')
+
+        # 初始化 CUDA Driver
+        result = lib.cuInit(0)
+        if result != 0:
+            return 0
+
+        # 获取设备数量
+        count = ctypes.c_int()
+        result = lib.cuDeviceGetCount(ctypes.byref(count))
+        if result != 0 or count.value == 0:
+            return 0
+
+        # 获取第一个设备
+        device = ctypes.c_int()
+        result = lib.cuDeviceGet(ctypes.byref(device), 0)
+        if result != 0:
+            return 0
+
+        # CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT = 16
+        sm_count = ctypes.c_int()
+        result = lib.cuDeviceGetAttribute(
+            ctypes.byref(sm_count), 16, device,
+        )
+        if result != 0 or sm_count.value == 0:
+            return 0
+
+        # CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75
+        major = ctypes.c_int()
+        lib.cuDeviceGetAttribute(ctypes.byref(major), 75, device)
+
+        # CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 76
+        minor = ctypes.c_int()
+        lib.cuDeviceGetAttribute(ctypes.byref(minor), 76, device)
+
+        # 按计算能力查找每 SM 核心数
+        key = (major.value, minor.value)
+        if key in _SM_CORES_BY_CC:
+            cores_per_sm = _SM_CORES_BY_CC[key]
+        else:
+            # 回退：按 major 版本找该系列最大已知值
+            fallback = max(
+                (v for (m, _), v in _SM_CORES_BY_CC.items() if m == major.value),
+                default=128,  # 现代架构最少 128
+            )
+            cores_per_sm = fallback
+
+        return sm_count.value * cores_per_sm
+    except Exception:
+        return 0
 
 
 def _detect_nvenc_generation(gpu_name: str) -> int:
