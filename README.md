@@ -2,9 +2,9 @@
 
 <img src="icon.png" height="90" width="90"/>
 
-# ustxPlayer
+# ustxPlayer-preview
 
-`v26h06` · 基于 [ustPlayer](https://github.com/SYEternalR/ustPlayer) 二次开发的 USTX 工程可视化工具。
+`v26h07` · 基于 [ustxPlayer](https://github.com/SYEternalR/ustxPlayer) 二次开发的 USTX 工程可视化工具。
 
 ![GitHub Release](https://img.shields.io/github/v/release/lyrinXD/ustxPlayer?style=for-the-badge)
 ![GitHub All Releases](https://img.shields.io/github/downloads/lyrinXD/ustxPlayer/total?style=for-the-badge)
@@ -17,7 +17,7 @@
 </div>
 
 > [!NOTE]
-> 本项目是 ustPlayer 的二次开发版本，核心定位从 UST 转向 **USTX**，并围绕播放体验、样式系统、歌词支持等方面进行了大量改进。
+> 本项目是 ustxPlayer 的二次开发版本，核心定位从 UST 转向 **USTX**，并围绕播放体验、样式系统、歌词支持等方面进行了大量改进。
 
 ## 主要特性
 
@@ -107,14 +107,14 @@ python -m PyInstaller --onefile --windowed --icon=icon.ico --name=ustxPlayer \
 ## 使用提示
 
 - 歌词推荐使用 **交错** 或 **独立** 格式；合并格式可能显示异常。
-- 工程文件（`.uplr`）采用全新格式，**不兼容旧版 ustPlayer 的 `.uplr` 文件**。新格式内嵌 USTX 内容，可独立分发，无需额外携带 `.ustx` 文件。
+- 工程文件（`.uplr`）采用全新格式，**不兼容旧版 ustxPlayer 的 `.uplr` 文件**。新格式内嵌 USTX 内容，可独立分发，无需额外携带 `.ustx` 文件。
 - 工程文件（.uplr）中的 ustx 等文件路径**可以为空**，故工程文件可做模板使用。
 - 同时打开两个界面会出现异常的BUG已在v26h04版本修复修复。
 
 
 ## 致谢
 
-本项目时基于 **[ustPlayer](https://github.com/SYEternalR/ustPlayer)** 二次开发的第三方优化版，由github-2000-07-05修改，原项目由 **[SYEternal_R](https://github.com/SYEternalR)** 与 **[灰棱HiRenG](https://github.com/HiRenG1145)** 创建。
+本项目时基于 **[ustxPlayer](https://github.com/SYEternalR/ustxPlayer)** 二次开发的第三方优化版，由github-2000-07-05修改，原项目由 **[SYEternal_R](https://github.com/SYEternalR)** 与 **[灰棱HiRenG](https://github.com/HiRenG1145)** 创建。
 
 ### 使用的资源与库
 
@@ -127,12 +127,12 @@ python -m PyInstaller --onefile --windowed --icon=icon.ico --name=ustxPlayer \
 
 ## 协议与许可
 
-本项目沿用原项目（ustPlayer）的使用协议，使用前请务必阅读并同意相关使用协议：
+本项目沿用原项目（ustxPlayer）的使用协议，使用前请务必阅读并同意相关使用协议：
 
 - 软件内入口：`其他 > 关于软件`，点击「上游使用协议」或「GNU LGPL v3.0」即可在软件内直接查看全文
 - 程序目录下 [`Terms.txt`](Terms.txt)（上游使用协议）与 [`LICENSE`](LICENSE)（GNU LGPL v3.0）
 
-ustPlayer 原项目版权由 SYEternalR 所有。本项目（ustxPlayer）在 ustPlayer 基础上进行二次开发，授权给符合条件的用户免费使用。
+ustxPlayer 原项目版权由 SYEternalR 所有。本项目（ustxPlayer-preview）在 ustxPlayer 基础上进行二次开发，授权给符合条件的用户免费使用。
 
 本工具在开发过程中使用了 AI 工具进行辅助开发。
 
