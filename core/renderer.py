@@ -15,6 +15,7 @@
 
 import os
 import re
+import time
 import shutil
 import subprocess
 import threading
@@ -1208,6 +1209,20 @@ def _clear_glyph_cache():
         pass
 
 
+def clear_renderer_cache():
+    """释放渲染器模块级缓存，减少内存占用。
+
+    渲染导出完成后或页面切换时调用，释放字形缓存、CUDA 上下文等。
+    """
+    _clear_glyph_cache()
+    _clear_cuda_contexts()
+    # 关闭保存线程池（如果还活着）
+    _shutdown_save_pool()
+    # 清理渲染错误缓存
+    clear_last_render_error()
+    logger.debug("渲染器模块级缓存已释放")
+
+
 def _get_glyph_texture(
     text: str, font: QFont, color: QColor, fm: QFontMetrics,
 ) -> Tuple[Any, int, int]:
@@ -1356,9 +1371,12 @@ def _get_cuda_ctx(width: int, height: int) -> "_CudaRenderContext":
 
 def _clear_cuda_contexts():
     """清空所有线程的 CUDA 渲染上下文（渲染结束后释放显存）。"""
-    import cupy as cp
     _CUDA_LOCAL.__dict__.pop("ctx", None)
-    cp.get_default_memory_pool().free_all_blocks()
+    try:
+        import cupy as cp
+        cp.get_default_memory_pool().free_all_blocks()
+    except ImportError:
+        pass
 
 
 def _render_frame_cuda(
@@ -2003,13 +2021,53 @@ def _encode_video(
             if progress_callback:
                 progress_callback(30, 100, "编码")
             logger.info(f"FFmpeg 视频编码命令: {' '.join(video_cmd)}")
-            result = subprocess.run(
-                video_cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=3600,
+
+            # 计算视频总时长，用于实时进度映射
+            total_duration = sum(s.frame_count for s in frame_states) / fps
+            process = subprocess.Popen(
+                video_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
                 creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0,
             )
-            if result.returncode != 0:
-                tail = result.stderr.strip()[-1500:] if result.stderr else "(无 stderr 输出)"
-                msg = f"FFmpeg 视频编码失败 (退出码 {result.returncode}):\n{tail}"
+
+            # 实时读取 stderr，解析 time= 字段更新编码进度
+            # 只保留最近 200 行 stderr 用于错误报告，避免长视频时内存膨胀
+            _MAX_STDERR_LINES = 200
+            stderr_lines = []
+            assert process.stderr is not None
+            for line in process.stderr:
+                if len(stderr_lines) < _MAX_STDERR_LINES:
+                    stderr_lines.append(line)
+                else:
+                    # 超过上限时滚动替换，只保留最近 200 行
+                    stderr_lines.append(line)
+                    stderr_lines = stderr_lines[-_MAX_STDERR_LINES:]
+                m = re.search(r'time=(\d+):(\d+):(\d+)\.(\d+)', line)
+                if m and total_duration > 0:
+                    h, mn, s = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                    frac_str = m.group(4)
+                    # 归一化到毫秒：2 位百分秒 → 3 位毫秒，3+ 位截取前 3
+                    if len(frac_str) >= 3:
+                        ms = int(frac_str[:3])
+                    else:
+                        ms = int(frac_str) * (10 ** (3 - len(frac_str)))
+                    current_time = h * 3600 + mn * 60 + ms / 1000
+                    time_frac = min(current_time / total_duration, 1.0)
+                    phase_progress = 30 + time_frac * 50  # 30% → 80%
+                    if progress_callback:
+                        progress_callback(int(phase_progress), 100, "编码")
+
+            process.wait()
+            returncode = process.returncode
+            stderr_text = ''.join(stderr_lines)
+
+            if returncode != 0:
+                tail = stderr_text.strip()[-1500:] if stderr_text else "(无 stderr 输出)"
+                msg = f"FFmpeg 视频编码失败 (退出码 {returncode}):\n{tail}"
                 logger.error(msg)
                 set_last_render_error(msg)
                 return False
@@ -2119,13 +2177,19 @@ def _encode_dual_nvenc(
             creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0,
         )
 
-    # 并行编码两个段
+    # 并行编码两个段，确保线程始终被 join（即使异常）
     t1 = threading.Thread(target=encode_segment, args=(concat_a, output_a, 0))
     t2 = threading.Thread(target=encode_segment, args=(concat_b, output_b, 1))
     t1.start()
     t2.start()
-    t1.join()
-    t2.join()
+    try:
+        t1.join()
+        t2.join()
+    except Exception:
+        # 确保线程引用被清理
+        t1.join(timeout=1)
+        t2.join(timeout=1)
+        raise
 
     # 合并两个段
     concat_list = os.path.join(temp_dir, "concat_segments.txt")
@@ -2196,6 +2260,9 @@ def render_video(
     os.makedirs(temp_dir, exist_ok=True)
 
     try:
+        # 导出计时器：记录每个阶段耗时，最后输出到日志
+        _t0 = time.monotonic()
+
         # 三阶段总进度：每阶段占 1/3（33%），映射到总 0-100
         _PHASE_BASE = {"预计算": 0, "GPU渲染": 33, "编码": 66}
         _PHASE_SPAN = {"预计算": 33, "GPU渲染": 33, "编码": 34}
@@ -2276,6 +2343,11 @@ def render_video(
 
         _emit_progress(100, "预计算")
 
+        # 预计算阶段计时
+        _t1 = time.monotonic()
+        _precompute_elapsed = _t1 - _t0
+        logger.info(f"[导出计时] 预计算阶段耗时: {_precompute_elapsed:.2f}s")
+
         # ==================== 阶段 2: 渲染 ====================
         _emit_progress(0, "GPU渲染")
 
@@ -2339,6 +2411,12 @@ def render_video(
         logger.info(f"渲染完成: {len(all_paths)} 帧, 后端={backend_name}")
         _emit_progress(100, "GPU渲染")
 
+        # 渲染阶段计时
+        _t2 = time.monotonic()
+        _render_elapsed = _t2 - _t1
+        _fps_render = len(all_paths) / _render_elapsed if _render_elapsed > 0 else 0
+        logger.info(f"[导出计时] 渲染阶段耗时: {_render_elapsed:.2f}s (约 {_fps_render:.1f} 帧/秒)")
+
         # ==================== 阶段 3: 编码 ====================
         _emit_progress(0, "编码")
 
@@ -2354,6 +2432,20 @@ def render_video(
 
         _emit_progress(100 if success else 99, "编码")
 
+        # 编码阶段计时 + 导出总耗时汇总
+        _t3 = time.monotonic()
+        _encode_elapsed = _t3 - _t2
+        _total_elapsed = _t3 - _t0
+        _out_frames = total_output_frames if success else 0
+        logger.info(
+            f"[导出计时] 编码阶段耗时: {_encode_elapsed:.2f}s\n"
+            f"[导出计时] 导出总耗时: {_total_elapsed:.2f}s\n"
+            f"[导出计时] 各阶段占比: 预计算 {_precompute_elapsed:.1f}s | "
+            f"渲染 {_render_elapsed:.1f}s | 编码 {_encode_elapsed:.1f}s\n"
+            f"[导出计时] 输出帧数: {_out_frames} 帧, "
+            f"实际帧率: {_out_frames / _total_elapsed:.1f} fps"
+        )
+
         # ==================== 阶段 7: 清理 ====================
         try:
             # 保留临时文件用于调试
@@ -2361,6 +2453,18 @@ def render_video(
                 shutil.rmtree(temp_dir, ignore_errors=True)
         except Exception:
             pass
+
+        # 显式释放大内存对象，减少内存占用
+        # frame_states 列表可能包含大量 FrameState 对象
+        # fonts 字典中的 QFont/QFontMetrics 对象占用大
+        # all_paths 列表中的路径字符串也占用内存
+        del frame_states
+        del fonts
+        del chunks
+        all_paths.clear()
+        # 强制触发一次垃圾回收，释放循环引用
+        import gc
+        gc.collect()
 
         return success
 
@@ -2372,4 +2476,8 @@ def render_video(
             shutil.rmtree(temp_dir, ignore_errors=True)
         except Exception:
             pass
+        # 释放模块级缓存 + 强制 GC
+        clear_renderer_cache()
+        import gc
+        gc.collect()
         return False

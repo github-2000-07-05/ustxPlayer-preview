@@ -422,12 +422,18 @@ class FilePage(QWidget, CardPageMixin):
                      parent=self.window(), position=InfoBarPosition.TOP_RIGHT)
 
     def cleanup_parse_thread(self):
-        """退出前等待后台解析线程结束，避免 QThread 仍在运行时被回收崩溃。"""
+        """退出前优雅关闭后台解析线程，不阻塞主线程。
+
+        仅 quit() 并等待极短时间，不阻塞 app 退出流程。
+        若线程未及时退出，Python 进程退出时会自动终结 daemon 线程。
+        """
         if self._parse_thread is not None:
             try:
                 self._parse_thread.quit()
-                self._parse_thread.wait(3000)
+                # 最多等 100ms，不阻塞 UI 线程
+                if not self._parse_thread.wait(100):
+                    logger.warning("解析线程未在 100ms 内退出，将在进程退出时自动终结")
             except Exception:
-                logger.exception("等待解析线程结束失败")
+                logger.exception("清理解析线程失败")
             self._parse_thread = None
             self._parse_worker = None

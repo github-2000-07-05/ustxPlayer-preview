@@ -191,6 +191,9 @@ class SettingsManager(QObject):
     def ustx_path(self, v: str):
         if self._ustx_path != v:
             self._ustx_path = v
+            # 路径变化时清除缓存，下次使用时会重新解析
+            self._cached_ust_info = None
+            self._ustx_notes = []
             self.ustx_path_changed.emit(v)
 
     @property
@@ -516,6 +519,18 @@ class SettingsManager(QObject):
     @cached_ust_info.setter
     def cached_ust_info(self, v: Optional[dict]):
         self._cached_ust_info = v
+
+    def clear_cached_data(self):
+        """释放内存中的缓存数据（音符列表、解析结果、歌词内容）。
+
+        切换工程或不再需要内存数据时调用，避免持续占用内存。
+        下次使用时（如 _on_play）若缓存为空会从文件重新解析。
+        """
+        self._ustx_notes = []
+        self._cached_ust_info = None
+        self._lyric_content = ""
+        self._note_styles = {}
+        logger.debug("已清除内存缓存数据")
 
     def maybe_fill_project_name_from_ustx(self) -> bool:
         if not self._project_name.strip() and self._ustx_path:

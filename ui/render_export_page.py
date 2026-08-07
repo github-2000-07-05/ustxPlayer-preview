@@ -37,6 +37,7 @@ from core.renderer import (
     detect_hardware, precompute_frame_states, calc_optimal_workers,
     render_video, get_cuda_render_status, _select_render_backend,
     get_last_render_error, clear_last_render_error,
+    clear_renderer_cache,
 )
 
 # 常见分辨率选项（末尾追加"自定义"）
@@ -404,7 +405,8 @@ class RenderExportPage(QWidget):
                           parent=self._main_window, position=InfoBarPosition.TOP_RIGHT)
 
     def _on_back(self):
-        """返回进入渲染导出页之前的页面。"""
+        """返回进入渲染导出页之前的页面，并释放资源。"""
+        self.cleanup()
         self._main_window._exit_render_page()
 
     def _apply_backend_availability(self):
@@ -571,6 +573,8 @@ class RenderExportPage(QWidget):
     def _on_finished(self, ok: bool, output_path: str, error_msg: str):
         """渲染完成回调（主线程）。"""
         self._running = False
+        # 清理渲染线程和 Worker 引用，释放资源
+        self._cleanup_render_resources()
         # 隐藏任务栏进度
         if self._taskbar_progress:
             self._taskbar_progress.setVisible(False)
@@ -617,6 +621,46 @@ class RenderExportPage(QWidget):
         self.stage_label.setVisible(False)
         self._last_stage = ""
 
+    def _cleanup_render_resources(self):
+        """清理渲染线程和 Worker 引用，释放线程资源。"""
+        # 清理 worker 信号连接，断开所有信号
+        if self._worker is not None:
+            try:
+                self._worker.progress.disconnect()
+            except Exception:
+                pass
+            try:
+                self._worker.finished.disconnect()
+            except Exception:
+                pass
+            self._worker.deleteLater()
+            self._worker = None
+        # 线程引用置空（threading.Thread 是 daemon，自然结束即可）
+        self._thread = None
+
+    def cleanup(self):
+        """页面销毁/切换时释放所有资源，包括渲染线程和缓存数据。"""
+        self._cleanup_render_resources()
+        # 释放渲染器模块级缓存（字形缓存、CUDA 上下文等）
+        clear_renderer_cache()
+        # 释放 Settings 中的缓存数据（音符列表、解析结果等）
+        if self._settings is not None:
+            self._settings.clear_cached_data()
+        # 释放硬件检测缓存
+        self._hw = None
+        # 销毁任务栏进度对象
+        if self._taskbar_progress:
+            try:
+                self._taskbar_progress = None
+            except Exception:
+                pass
+        # 停止预估定时器
+        if self._estim_timer:
+            try:
+                self._estim_timer.stop()
+            except Exception:
+                pass
+
     def _on_open_video(self):
         """打开视频文件，然后重置到初始状态。"""
         if self._output_file and os.path.exists(self._output_file):
@@ -636,7 +680,8 @@ class RenderExportPage(QWidget):
         self._refresh_estimates()
 
     def reset_state(self):
-        """再次进入页面时重置渲染状态。"""
+        """再次进入页面时重置渲染状态，并清理旧线程资源。"""
+        self._cleanup_render_resources()
         self._running = False
         self._last_stage = ""
         self.start_btn.setVisible(True)

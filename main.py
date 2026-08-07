@@ -522,6 +522,11 @@ class MainWindow(FluentWindow):
         # 切换前清除歌词编辑页的选中
         self.lyric_edit_page.table.clearSelection()
         self.lyric_edit_page.table.setCurrentCell(-1, -1)
+        # 如果当前在渲染页面，切换到其他页面时释放渲染资源
+        if self._render_page is not None:
+            current = self.stackedWidget.currentWidget()
+            if current is not None and current is self.scroll_render_page:
+                self._render_page.cleanup()
         super().switchTo(interface)
         # 隐藏导航栏可能残留的浮动 tooltip
         self._hide_orphan_tooltips()
@@ -615,21 +620,27 @@ def main():
     splash.show()
     splash.fade_in()
     splash.set_message("正在加载界面...")
-    app.processEvents()
 
-    logger.info("正在创建主窗口...")
-    window = MainWindow()
-    logger.info("主窗口创建完成，等待启动动画结束")
+    # 用 QTimer 延迟创建主窗口，避免 app.processEvents() 阻塞 UI 线程
+    # 让 splash 先渲染出来，主窗口创建等事件循环启动后再执行
+    _window_holder = []  # 保持主窗口引用，防止 GC
 
-    # 动画展示满 5 秒开始淡出时，才显示主窗口（实现「动画期间加载 GUI，动画结束后启动 GUI」）
-    def _show_main_window():
-        window.show()
-        logger.info("主窗口已显示")
-    splash.set_message("启动完成")
-    splash.finish(on_fade_out=_show_main_window)
+    def _create_main_window():
+        logger.info("正在创建主窗口...")
+        window = MainWindow()
+        _window_holder.append(window)
+        logger.info("主窗口创建完成，等待启动动画结束")
 
-    # 退出时清理：停止 file_page 后台解析线程
-    app.aboutToQuit.connect(window.file_page.cleanup_parse_thread)
+        def _show_main_window():
+            window.show()
+            logger.info("主窗口已显示")
+        splash.set_message("启动完成")
+        splash.finish(on_fade_out=_show_main_window)
+
+        # 退出时清理：停止 file_page 后台解析线程
+        app.aboutToQuit.connect(window.file_page.cleanup_parse_thread)
+
+    QTimer.singleShot(0, _create_main_window)
 
     sys.exit(app.exec())
 
