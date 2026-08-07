@@ -2,16 +2,17 @@
 """Settings.ini 配置读写 + .uplr 工程文件导入/导出。
 
 通过 Qt Signal 通知 UI 所有配置变更。
+
+支持两种导出模式：
+- 普通导出：兼容原项目 TS player，导入需重新解析
+- 精简导出（BETA）：预解析数据直接存储，导入时零解析、零缓存文件
 """
 
 import os
 import sys
 import json
 import copy
-import hashlib
-import shutil
 import configparser
-import time
 from typing import Optional
 
 from PySide6.QtCore import QObject, Signal
@@ -28,7 +29,6 @@ class ProjectFileMissingError(Exception):
     """
 
     def __init__(self, missing: list[tuple[str, str]]):
-        # missing: [(字段标签, 路径), ...]
         self.missing = missing
         lines = "\n".join(f"  - {label}: {path}" for label, path in missing)
         super().__init__(f"以下文件路径不存在:\n{lines}")
@@ -65,7 +65,6 @@ class SettingsManager(QObject):
     # 字体（逐字歌词字体 / 歌词及信息字体 分开控制）
     word_lyric_font_family_changed = Signal(str)
     info_font_family_changed = Signal(str)
-    # 自定义字体文件路径（写入 .uplr，打开工程时按路径重新加载恢复）
     custom_font_paths_changed = Signal(list)
 
     # 歌词及信息颜色（独立于样式）
@@ -73,13 +72,12 @@ class SettingsManager(QObject):
 
     # 样式系统信号
     active_style_index_changed = Signal(int)
-    styles_changed = Signal()  # 样式数据变更（颜色/增删）
+    styles_changed = Signal()
     global_bg_color_changed = Signal(str)
     global_bg_enabled_changed = Signal(bool)
 
     # 音符数据信号（供歌词编辑页使用）
     ustx_notes_changed = Signal(list)
-    # 逐音符样式（供播放器渲染用）
     note_styles_changed = Signal(object)
 
     # 布尔信号
@@ -99,12 +97,6 @@ class SettingsManager(QObject):
     custom_accent_color_changed = Signal(str)
 
     # ===================== .uplr 工程文件字段注册表 =====================
-    # 数据驱动的字段序列化：导出/导入共用单一真相源。
-    # 类型约定: str/bool/int/float/json。
-    # 注意：
-    #   - 主题/强调色属于用户级 UI 偏好，仅写入 Settings.ini，不参与 .uplr。
-    #   - ustx_notes 是解析缓存，由 ustx_content 还原后重新解析得到，不直接持久化。
-    #   - 导入顺序敏感字段(ustx_path/styles/active_style_index/note_styles)在 import_uplr 中单独处理。
     PROJECT_SCHEMA = [
         # 基础元信息
         ("project_name", "str"),
@@ -172,29 +164,18 @@ class SettingsManager(QObject):
         self.terms_file_path = os.path.join(self.program_root, "Terms.txt")
         self.license_file_path = os.path.join(self.program_root, "LICENSE")
 
-        # 缓存目录（程序根目录下，存放 ustx 等还原缓存）
-        # 启动与退出时各清空一次（仅删除本程序创建的 ustx_cache_* 文件）：
-        # 启动确保干净状态，退出释放空间。
-        self.cache_dir = os.path.join(self.program_root, "cache")
-        try:
-            os.makedirs(self.cache_dir, exist_ok=True)
-        except Exception:
-            logger.exception(f"创建缓存目录失败: {self.cache_dir}")
-        self.clear_cache()
-
         # 默认路径
         default_desktop = os.path.join(os.path.expanduser("~"), "Desktop")
         self.last_open_dir = default_desktop
         self.last_export_dir = default_desktop
 
         # ===== 工程字段（PROJECT_SCHEMA）默认值 =====
-        # 默认值统一定义在 _get_project_defaults()，__init__ 与 import_uplr 共用。
         self._reset_project_to_defaults()
 
         # ===== 用户级 UI 偏好（不参与 .uplr 工程导入/导出，仅写入 Settings.ini）=====
-        self._theme_mode = "auto"  # auto=跟随系统, light=亮色, dark=暗色
-        self._accent_color_mode = "auto"  # 持久化于 Settings.ini 的 ThemeSettings（auto=跟随系统, custom=自定义）
-        self._custom_accent_color = "#8245aa"  # 自定义强调色（持久化）
+        self._theme_mode = "auto"
+        self._accent_color_mode = "auto"
+        self._custom_accent_color = "#8245aa"
 
         # 初始化配置
         self._config = configparser.ConfigParser()
@@ -386,7 +367,6 @@ class SettingsManager(QObject):
 
     @property
     def word_lyric_font_family(self) -> str:
-        """逐字歌词字体（播放器中央大字）。"""
         return self._word_lyric_font_family
 
     @word_lyric_font_family.setter
@@ -397,7 +377,6 @@ class SettingsManager(QObject):
 
     @property
     def info_font_family(self) -> str:
-        """歌词及信息字体（LRC 歌词、音名、BPM、时间、版权等）。"""
         return self._info_font_family
 
     @info_font_family.setter
@@ -408,7 +387,6 @@ class SettingsManager(QObject):
 
     @property
     def custom_font_paths(self) -> list:
-        """自定义字体文件路径列表（写入工程文件，打开时按路径重新加载恢复）。"""
         return self._custom_font_paths
 
     @custom_font_paths.setter
@@ -427,6 +405,17 @@ class SettingsManager(QObject):
             self._info_text_color = v
             self.info_text_color_changed.emit(v)
 
+    # ===================== 歌词内容（内存缓存，精简导入时使用）=====================
+
+    @property
+    def lyric_content(self) -> str:
+        """精简导入时从工程文件加载的歌词完整内容（内存中，不写磁盘）。"""
+        return self._lyric_content
+
+    @lyric_content.setter
+    def lyric_content(self, v: str):
+        self._lyric_content = v
+
     # ===================== 样式系统属性 =====================
 
     @property
@@ -442,7 +431,6 @@ class SettingsManager(QObject):
         if 0 <= v < len(self._styles) and self._active_style_index != v:
             self._active_style_index = v
             self.active_style_index_changed.emit(v)
-            # 同步当前样式颜色到基础颜色属性（build_ust_info 的 fallback）
             p = self._styles[v]
             self._bg_color = p.get("bg_color", "#000000")
             self._note_color = p.get("note_color", "#6c6c6c")
@@ -451,15 +439,12 @@ class SettingsManager(QObject):
 
     @property
     def active_style(self) -> dict:
-        """返回当前激活样式的 dict。"""
         return self._styles[self._active_style_index] if self._styles else {}
 
     def set_style_color(self, style_index: int, key: str, value: str):
-        """设置指定样式的某个颜色值。"""
         if 0 <= style_index < len(self._styles):
             if self._styles[style_index].get(key) != value:
                 self._styles[style_index][key] = value
-                # 如果是当前激活样式，同步基础颜色属性
                 if style_index == self._active_style_index:
                     if key == "bg_color":
                         self._bg_color = value
@@ -476,25 +461,21 @@ class SettingsManager(QObject):
         return len(self._styles)
 
     def add_style(self):
-        """新建样式（复制样式1的颜色），返回新索引。"""
         new_idx = len(self._styles)
-        self._styles.append(dict(self._styles[0]))  # 复制样式1
+        self._styles.append(dict(self._styles[0]))
         logger.info(f"样式系统: 新建样式{new_idx + 1}（共{len(self._styles)}个）")
         self.styles_changed.emit()
         return new_idx
 
     def remove_style(self, index: int) -> bool:
-        """删除指定索引的样式。至少保留3个样式（默认样式不可删）。"""
         if len(self._styles) <= 3 or index < 0 or index >= len(self._styles):
             return False
         del self._styles[index]
         logger.info(f"样式系统: 删除样式{index + 1}（剩余{len(self._styles)}个）")
-        # 调整 active index
         if self._active_style_index >= len(self._styles):
             self._active_style_index = len(self._styles) - 1
         elif self._active_style_index > index:
             self._active_style_index -= 1
-        # 重映射逐音符样式：被删样式→样式1，后面的样式索引前移
         new_styles = {}
         for row, si in self._note_styles.items():
             if si == index:
@@ -503,8 +484,7 @@ class SettingsManager(QObject):
                 new_styles[row] = si - 1
             else:
                 new_styles[row] = si
-        self.note_styles = new_styles  # 走 setter 发射 note_styles_changed
-        # 同步基础颜色属性
+        self.note_styles = new_styles
         p = self._styles[self._active_style_index]
         self._bg_color = p.get("bg_color", "#000000")
         self._note_color = p.get("note_color", "#6c6c6c")
@@ -515,7 +495,6 @@ class SettingsManager(QObject):
         return True
 
     def get_style_name(self, index: int) -> str:
-        """获取样式显示名称（样式1, 样式2, ...）。"""
         return f"样式{index + 1}"
 
     # ===================== 音符数据（歌词编辑用） =====================
@@ -527,7 +506,7 @@ class SettingsManager(QObject):
     @ustx_notes.setter
     def ustx_notes(self, v: list):
         self._ustx_notes = v
-        self._note_styles = {}  # 新音符时清空样式
+        self._note_styles = {}
         self.ustx_notes_changed.emit(v)
 
     @property
@@ -536,25 +515,18 @@ class SettingsManager(QObject):
 
     @cached_ust_info.setter
     def cached_ust_info(self, v: Optional[dict]):
-        # 纯内存缓存，无 signal
         self._cached_ust_info = v
 
     def maybe_fill_project_name_from_ustx(self) -> bool:
-        """项目名为空时，用 ustx 文件名（不含扩展名）自动填充。
-
-        仅在导入 ustx 文件时调用。project_name 非空则保持不变。
-        返回 True 表示执行了填充。
-        """
         if not self._project_name.strip() and self._ustx_path:
             base = os.path.splitext(os.path.basename(self._ustx_path))[0]
             if base:
-                self.project_name = base  # 走 setter 触发信号
+                self.project_name = base
                 return True
         return False
 
     @property
     def note_styles(self) -> dict:
-        """逐音符样式映射 {行号: 样式索引}。"""
         return self._note_styles
 
     @note_styles.setter
@@ -583,7 +555,6 @@ class SettingsManager(QObject):
             self.global_bg_enabled_changed.emit(v)
 
     def get_effective_bg_color(self) -> str:
-        """获取实际生效的背景色（考虑全局背景开关）。"""
         if self._global_bg_enabled:
             return self._global_bg_color
         return self.active_style.get("bg_color", "#000000")
@@ -768,7 +739,6 @@ class SettingsManager(QObject):
     # ===================== Settings.ini 读写 =====================
 
     def read_settings(self):
-        """读取配置文件，恢复上次的导入/导出路径。"""
         default_desktop = os.path.join(os.path.expanduser("~"), "Desktop")
         try:
             if os.path.exists(self.settings_path):
@@ -784,7 +754,6 @@ class SettingsManager(QObject):
                         self.last_open_dir = default_desktop
                     if not os.path.isdir(self.last_export_dir):
                         self.last_export_dir = default_desktop
-                # 读取主题设置
                 if "ThemeSettings" in self._config:
                     mode = self._config["ThemeSettings"].get("theme_mode", "auto")
                     self._theme_mode = mode if mode in ("auto", "light", "dark") else "auto"
@@ -802,9 +771,7 @@ class SettingsManager(QObject):
             logger.exception("读取配置文件失败")
 
     def write_settings(self):
-        """将路径和主题偏好写入配置文件（样式等不持久化，由 .uplr 工程文件管理）。"""
         try:
-            # 完全重建配置，避免旧数据残留
             self._config = configparser.ConfigParser()
             self._config["PathSettings"] = {
                 "last_open_dir": self.last_open_dir,
@@ -815,8 +782,6 @@ class SettingsManager(QObject):
                 "accent_color_mode": self._accent_color_mode,
                 "custom_accent_color": self._custom_accent_color,
             }
-
-            # 原子写入：先写临时文件再替换，避免中途失败损坏已有配置
             tmp = self.settings_path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 self._config.write(f)
@@ -824,45 +789,9 @@ class SettingsManager(QObject):
         except Exception:
             logger.exception("写入配置文件失败")
 
-    # ===================== 缓存目录管理 =====================
-
-    # 本程序创建的缓存文件名前缀（import_uplr 写入 ustx_cache_*.ustx）
-    CACHE_FILE_PREFIX = "ustx_cache_"
-
-    def clear_cache(self):
-        """仅清空本程序创建的缓存文件（保留目录本身及其他文件）。
-
-        只删除文件名以 CACHE_FILE_PREFIX 开头的文件，避免误删用户或其他
-        程序放入缓存目录的内容。在程序启动与退出时各调用一次：启动清空
-        确保干净状态并覆盖上次异常退出的残留；退出清空释放磁盘空间。
-        单个文件删除失败不影响其余文件。
-        """
-        try:
-            if not os.path.isdir(self.cache_dir):
-                return
-            for name in os.listdir(self.cache_dir):
-                if not name.startswith(self.CACHE_FILE_PREFIX):
-                    continue
-                fp = os.path.join(self.cache_dir, name)
-                try:
-                    if os.path.isfile(fp) or os.path.islink(fp):
-                        os.remove(fp)
-                    elif os.path.isdir(fp):
-                        shutil.rmtree(fp)
-                except Exception:
-                    logger.exception(f"删除缓存文件失败: {fp}")
-        except Exception:
-            logger.exception("清空缓存目录失败")
-
     # ===================== 工程字段默认值与重置 =====================
 
     def _get_project_defaults(self) -> dict:
-        """返回所有 PROJECT_SCHEMA 字段的默认值（每次返回新副本）。
-
-        作为工程字段默认值的单一真相源，__init__ 与 import_uplr 共用。
-        styles/custom_font_paths/note_styles 为可变对象，调用方需自行 deepcopy
-        （_reset_project_to_defaults 已处理）。
-        """
         return {
             # 基础元信息
             "project_name": "",
@@ -870,7 +799,7 @@ class SettingsManager(QObject):
             "song_name": "",
             "song_author": "",
             "ust_author": "",
-            # 颜色（与活动样式联动，build_ust_info 中作为 fallback）
+            # 颜色
             "bg_color": "#000000",
             "note_color": "#6c6c6c",
             "lyric_color": "#ffffff",
@@ -890,7 +819,7 @@ class SettingsManager(QObject):
             "end_custom_text": "",
             "pitch_placeholder": "无",
             "pitch_custom_text": "",
-            # 字体（逐字歌词字体 / 歌词及信息字体）
+            # 字体
             "word_lyric_font_family": "等线",
             "info_font_family": "微软雅黑",
             # 自定义字体文件路径
@@ -910,7 +839,7 @@ class SettingsManager(QObject):
             "show_lyric_autohide": True,
             "lyric_autohide_threshold": 3.0,
             "curve_show": False,
-            # 样式系统（结构化数据，导入顺序敏感）
+            # 样式系统
             "styles": [
                 {"bg_color": "#000000", "note_color": "#6c6c6c", "lyric_color": "#ffffff", "pitch_curve_color": "#ffffff"},
                 {"bg_color": "#000000", "note_color": "#ff8a80", "lyric_color": "#ff0c0c", "pitch_curve_color": "#ff0c0c"},
@@ -918,32 +847,26 @@ class SettingsManager(QObject):
             ],
             "active_style_index": 0,
             "note_styles": {},
+            # 歌词内容（内存缓存，精简导入时使用）
+            "lyric_content": "",
         }
 
     def _reset_project_to_defaults(self):
-        """将所有 PROJECT_SCHEMA 字段重置为默认值。
-
-        直接写 backing field（不经 setter），避免 active_style_index setter 同步
-        颜色、note_styles setter 发信号等副作用。同时清空 ustx_notes 与解析缓存。
-        """
         defaults = self._get_project_defaults()
         for name, _ftype in self.PROJECT_SCHEMA:
             setattr(self, f"_{name}", copy.deepcopy(defaults[name]))
-        # 派生状态清空
+        # 额外非 schema 字段
+        self._lyric_content = ""
         self._ustx_notes = []
         self._cached_ust_info = None
-        # 延迟解析状态（import_uplr parse_ustx=False 暂存，后台解析完成后应用）
-        self._deferred_ustx_parse: dict | None = None
 
-    # ===================== .uplr 工程文件导入/导出 =====================
+    # ===================== .uplr 工程文件导出 =====================
 
     def export_uplr(self, output_file: str):
-        """导出全部配置到 .uplr 工程文件（JSON 格式）。
+        """普通导出：全量记录所有注册字段 + 内嵌完整 USTX 文件内容。
 
-        全量记录所有注册字段（含默认值），内嵌完整 ustx 文件内容。
-        三个文件(ustx/lrc/audio)为空时同样可导出（作为预设配置）。
+        兼容原项目 TS player，导入时需重新解析 USTX。
         """
-        # 读取 ustx 文件全文（无文件则为空串 → 预设场景）
         ustx_content = ""
         if self._ustx_path and os.path.isfile(self._ustx_path):
             try:
@@ -951,14 +874,11 @@ class SettingsManager(QObject):
                     ustx_content = f.read()
             except Exception:
                 logger.exception(f"读取 ustx 文件失败: {self._ustx_path}")
-                ustx_content = ""
 
-        # 全量序列化所有注册字段
         settings_data = {}
         for name, _ftype in self.PROJECT_SCHEMA:
             settings_data[name] = getattr(self, name)
 
-        # project_name 为空时兜底为"未命名"（仅写入导出文件）
         if not settings_data["project_name"].strip():
             settings_data["project_name"] = "未命名"
 
@@ -968,42 +888,109 @@ class SettingsManager(QObject):
             "ustx_content": ustx_content,
             "settings": settings_data,
         }
-        # 原子写入：先写临时文件再替换，避免中途失败损坏已有工程文件
         tmp = output_file + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
         os.replace(tmp, output_file)
 
+    def export_uplr_compact(self, output_file: str):
+        """精简导出（BETA）：存储预解析数据，导入时无需重新解析。
+
+        与普通导出的区别：
+        - 不存储原始 ustx_content
+        - 存储 parsed_notes（预解析音符列表，直接加载到内存）
+        - 存储 parsed_ust_info（tempo/version/tracks 等元信息）
+        - 歌词存完整内容（lyric_content）
+        - 音频仅存路径（与普通导出一致）
+        - 使用专属 format 标识符，其他软件无法解析
+        """
+        # 读取歌词文件内容
+        lyric_content = ""
+        if self._lrc_path and os.path.isfile(self._lrc_path):
+            try:
+                with open(self._lrc_path, "r", encoding="utf-8") as f:
+                    lyric_content = f.read()
+            except Exception:
+                logger.exception(f"读取歌词文件失败: {self._lrc_path}")
+
+        # 获取预解析的 ust_info（优先缓存，否则实时解析）
+        parsed_notes = []
+        parsed_ust_info = {}
+        cached = self._cached_ust_info
+        if cached and cached.get("info"):
+            info = cached["info"]
+            parsed_notes = info.get("notes", [])
+            parsed_ust_info = {
+                "version": info.get("version", "unknown"),
+                "tempo": info.get("tempo", 120.0),
+                "tracks": info.get("tracks", 1),
+                "track_name": info.get("track_name", "全部音轨"),
+            }
+        elif self._ustx_path and os.path.isfile(self._ustx_path):
+            try:
+                from core.ustxreader import get_ustx_info
+                info = get_ustx_info(self._ustx_path)
+                parsed_notes = info.get("notes", [])
+                parsed_ust_info = {
+                    "version": info.get("version", "unknown"),
+                    "tempo": info.get("tempo", 120.0),
+                    "tracks": info.get("tracks", 1),
+                    "track_name": info.get("track_name", "全部音轨"),
+                }
+            except Exception:
+                logger.exception("精简导出前解析 USTX 失败")
+
+        # 序列化所有注册字段
+        settings_data = {}
+        for name, _ftype in self.PROJECT_SCHEMA:
+            settings_data[name] = getattr(self, name)
+
+        if not settings_data["project_name"].strip():
+            settings_data["project_name"] = "未命名"
+
+        payload = {
+            "format": "ustxPlayer-preview-compact.uplr",
+            "version": 2,
+            "settings": settings_data,
+            # 精简导出专属数据
+            "parsed_notes": parsed_notes,
+            "parsed_ust_info": parsed_ust_info,
+            "lyric_content": lyric_content,
+        }
+        tmp = output_file + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, output_file)
+
+    # ===================== .uplr 工程文件导入 =====================
 
     def import_uplr(self, input_file: str, parse_ustx: bool = True):
-        """从 .uplr 工程文件导入全部配置（JSON 格式）。
+        """从 .uplr 工程文件导入全部配置。
 
-        导入顺序规避信号副作用清空结构化数据：
-          0) 重置所有 PROJECT_SCHEMA 字段为默认值，确保旧工程配置不残留；
-          1) 普通字段循环赋值，跳过顺序敏感字段；
-          2) styles（须在 active_style_index 之前）；
-          3) active_style_index（setter 同步基础颜色属性）；
-          4) ustx 还原：写入缓存（parse_ustx=True 时同步解析，False 时延迟解析）；
-          5) note_styles 最后赋值（在 ustx_notes 清空之后）；
-          6) 校验文件路径，缺失项一次性抛出 ProjectFileMissingError。
-        支持三个文件(ustx/lrc/audio)均为空的预设场景。
+        自动识别格式：
+        - 普通格式（ustxPlayer-preview.uplr）：从 ustx_content 直接解析到内存
+        - 精简格式（ustxPlayer-preview-compact.uplr）：加载预解析数据到内存
 
-        Args:
-            parse_ustx: 是否立即解析 USTX。False 时将解析推迟到后台线程，
-                        由 _apply_deferred_uplr_styles() 完成。
+        两种格式均不再创建缓存文件，解析结果直接写入内存变量。
         """
         with open(input_file, "r", encoding="utf-8") as f:
             payload = json.load(f)
 
-        # 校验工程文件格式，避免误导入任意 JSON 污染当前配置
-        if payload.get("format") != "ustxPlayer-preview.uplr" or payload.get("version") != 2:
+        fmt = payload.get("format", "")
+
+        # 精简格式 → 走专属导入逻辑
+        if fmt == "ustxPlayer-preview-compact.uplr":
+            self._import_uplr_compact(payload)
+            return
+
+        # 普通格式校验
+        if fmt != "ustxPlayer-preview.uplr" or payload.get("version") != 2:
             raise ValueError("不是有效的 ustxPlayer-preview 工程文件（format/version 不匹配）")
 
         data = payload.get("settings", {})
         ustx_content = payload.get("ustx_content", "") or ""
 
         # ---- 阶段0: 重置所有工程字段为默认值 ----
-        # 先校验格式再重置：格式非法时抛 ValueError，当前配置不受影响
         self._reset_project_to_defaults()
 
         # ---- 阶段1: 普通字段（跳过顺序敏感字段）----
@@ -1020,7 +1007,7 @@ class SettingsManager(QObject):
                     setattr(self, name, int(raw))
                 elif ftype == "float":
                     setattr(self, name, float(raw))
-                else:  # str / json
+                else:
                     setattr(self, name, raw)
             except (ValueError, TypeError):
                 logger.warning(f"工程文件字段 {name} 值非法，已跳过: {raw!r}")
@@ -1028,7 +1015,6 @@ class SettingsManager(QObject):
         # ---- 阶段2: styles（须先于 active_style_index）----
         styles = data.get("styles")
         if isinstance(styles, list) and styles:
-            # 补齐每个样式 dict 的缺失键，避免下游硬下标 KeyError
             _style_defaults = {
                 "bg_color": "#000000",
                 "note_color": "#6c6c6c",
@@ -1041,66 +1027,46 @@ class SettingsManager(QObject):
             ]
             self.styles_changed.emit()
 
-        # ---- 阶段3: active_style_index（setter 同步基础颜色属性）----
+        # ---- 阶段3: active_style_index ----
         if "active_style_index" in data:
             try:
                 idx = int(data["active_style_index"])
             except (ValueError, TypeError):
                 logger.warning(f"active_style_index 值非法，已忽略: {data['active_style_index']!r}")
                 idx = 0
-            # 越界时 clamp 到有效范围，避免下游 self._styles[idx] IndexError
             idx = max(0, min(idx, len(self._styles) - 1)) if self._styles else 0
             self.active_style_index = idx
 
-        # ---- 阶段4: ustx 还原（写入 cache 子目录）----
+        # ---- 阶段4: USTX 直接解析到内存（不再写缓存文件）----
         if ustx_content:
-            digest = hashlib.sha1(ustx_content.encode("utf-8")).hexdigest()[:10]
-            now = hashlib.sha1(str(time.time()).encode("utf-8")).hexdigest()[:10]
-            cache_path = os.path.join(self.cache_dir, f"ustx_cache_{digest}_{now}.ustx")
+            from core.ustxreader import get_ustx_info_from_content
             try:
-                with open(cache_path, "w", encoding="utf-8") as f:
-                    f.write(ustx_content)
-                self.ustx_path = cache_path
-                if parse_ustx:
-                    # 同步解析（传统行为，用于 basic_page 等非拖拽场景）
-                    from core.ustxreader import get_ustx_info
-                    ust_info = get_ustx_info(cache_path)
-                    _notes = ust_info.get("notes", [])
-                    self.ustx_notes = _notes if isinstance(_notes, list) else []
-                else:
-                    # 延迟解析：置空音符，由后台线程完成后填充
-                    self.ustx_notes = []
+                ust_info = get_ustx_info_from_content(ustx_content)
+                _notes = ust_info.get("notes", [])
+                self.ustx_notes = _notes if isinstance(_notes, list) else []
+                self.cached_ust_info = {
+                    "path": data.get("ustx_path", ""),
+                    "info": ust_info,
+                }
             except Exception:
-                logger.exception("还原 ustx 缓存失败，音符数据置空")
-                # 重置 ustx_path 为工程文件记录的原路径，避免残留指向半成品缓存
-                self._ustx_path = data.get("ustx_path", "")
+                logger.exception("内存解析 USTX 失败，音符数据置空")
                 self.ustx_notes = []
         else:
-            # 预设场景：保留工程文件中记录的 ustx_path（可为空），不解析
             self.ustx_path = data.get("ustx_path", "")
-            self.ustx_notes = []  # setter 清空 note_styles
+            self.ustx_notes = []
 
-        # ---- 阶段5: note_styles（必须在 ustx_notes 之后，否则会被清空）----
+        # 保留 ustx_path 为原始路径（用户参考用，可能不存在）
+        self._ustx_path = data.get("ustx_path", "")
+
+        # ---- 阶段5: note_styles ----
         ns = data.get("note_styles")
         if isinstance(ns, dict):
-            # JSON 键为字符串，需转回 int（行号/样式索引）
             self.note_styles = {int(k): int(v) for k, v in ns.items()}
         else:
             self.note_styles = {}
 
-        # ---- 延迟解析暂存（parse_ustx=False 时保存，后台解析完成后恢复）----
-        if not parse_ustx and ustx_content:
-            ns = data.get("note_styles")
-            self._deferred_ustx_parse = {
-                "cache_path": cache_path,
-                "note_styles": {int(k): int(v) for k, v in ns.items()} if isinstance(ns, dict) else {},
-            }
-
-        # ---- 阶段6: 校验文件路径（ustx/lrc/audio/custom_font_paths 非空路径必须存在）----
-        # 收集全部缺失路径后一次性抛出
+        # ---- 阶段6: 校验文件路径（ustx 不校验，已从内存解析）----
         missing: list[tuple[str, str]] = []
-        if self._ustx_path and not os.path.exists(self._ustx_path):
-            missing.append(("USTX 文件", self._ustx_path))
         if self._lrc_path and not os.path.exists(self._lrc_path):
             missing.append(("歌词文件", self._lrc_path))
         if self._audio_path and not os.path.exists(self._audio_path):
@@ -1111,22 +1077,111 @@ class SettingsManager(QObject):
         if missing:
             raise ProjectFileMissingError(missing)
 
-    def _apply_deferred_uplr_styles(self):
-        """后台解析完成后，恢复 UPLR 工程文件中保存的 note_styles。
+    def _import_uplr_compact(self, payload: dict):
+        """精简工程导入：预解析数据直接加载到内存，零缓存文件写入。
 
-        由 FilePage._apply_notes 在设置 ustx_notes 之后调用。
+        与普通导入的区别：
+        - 不读取 ustx_content
+        - 直接从 parsed_notes 恢复音符数据到内存
+        - 从 parsed_ust_info 恢复元信息
+        - 歌词内容存到 lyric_content 内存变量
+        - ustx_path 保留原路径（供参考，可能不存在）
         """
-        if self._deferred_ustx_parse is None:
-            return
-        ns = self._deferred_ustx_parse.get("note_styles", {})
+        if payload.get("version") != 2:
+            raise ValueError("精简工程文件版本不匹配")
+
+        data = payload.get("settings", {})
+
+        # 重置所有工程字段
+        self._reset_project_to_defaults()
+
+        # 普通字段恢复（跳过延迟字段）
+        for name, ftype in self.PROJECT_SCHEMA:
+            if name in self._DEFERRED_FIELDS:
+                continue
+            if name not in data:
+                continue
+            raw = data[name]
+            try:
+                if ftype == "bool":
+                    setattr(self, name, bool(raw))
+                elif ftype == "int":
+                    setattr(self, name, int(raw))
+                elif ftype == "float":
+                    setattr(self, name, float(raw))
+                else:
+                    setattr(self, name, raw)
+            except (ValueError, TypeError):
+                logger.warning(f"工程文件字段 {name} 值非法，已跳过: {raw!r}")
+
+        # styles
+        styles = data.get("styles")
+        if isinstance(styles, list) and styles:
+            _style_defaults = {
+                "bg_color": "#000000", "note_color": "#6c6c6c",
+                "lyric_color": "#ffffff", "pitch_curve_color": "#ffffff",
+            }
+            self._styles = [
+                {**_style_defaults, **s} if isinstance(s, dict) else dict(_style_defaults)
+                for s in styles
+            ]
+            self.styles_changed.emit()
+
+        # active_style_index
+        if "active_style_index" in data:
+            try:
+                idx = int(data["active_style_index"])
+            except (ValueError, TypeError):
+                idx = 0
+            idx = max(0, min(idx, len(self._styles) - 1)) if self._styles else 0
+            self.active_style_index = idx
+
+        # ---- 精简专属：预解析数据直接加载到内存 ----
+        parsed_notes = payload.get("parsed_notes", [])
+        parsed_ust_info = payload.get("parsed_ust_info", {})
+        if parsed_notes:
+            cached_info = {
+                "version": parsed_ust_info.get("version", "unknown"),
+                "tempo": parsed_ust_info.get("tempo", 120.0),
+                "tracks": parsed_ust_info.get("tracks", 1),
+                "track_name": parsed_ust_info.get("track_name", "全部音轨"),
+                "notes": parsed_notes,
+            }
+            self.ustx_notes = parsed_notes  # 直接加载到内存，零解析
+            self.cached_ust_info = {
+                "path": data.get("ustx_path", ""),
+                "info": cached_info,
+            }
+
+        # 歌词内容存到内存
+        lyric_content = payload.get("lyric_content", "")
+        if lyric_content:
+            self._lyric_content = lyric_content
+            self._lrc_path = data.get("lrc_path", "")
+
+        # ustx_path 保留原始路径
+        self._ustx_path = data.get("ustx_path", "")
+
+        # note_styles
+        ns = data.get("note_styles")
         if isinstance(ns, dict):
-            self.note_styles = ns
-        self._deferred_ustx_parse = None
+            self.note_styles = {int(k): int(v) for k, v in ns.items()}
+        else:
+            self.note_styles = {}
+
+        # 文件路径校验（仅校验音频和字体，USTX 和歌词已内嵌）
+        missing: list[tuple[str, str]] = []
+        if self._audio_path and not os.path.exists(self._audio_path):
+            missing.append(("音频文件", self._audio_path))
+        for font_path in self._custom_font_paths:
+            if font_path and not os.path.exists(font_path):
+                missing.append(("字体文件", font_path))
+        if missing:
+            raise ProjectFileMissingError(missing)
 
     # ===================== 构建播放器需要的 ust_info 字典 =====================
 
     def build_ust_info(self, core_ust_info: dict) -> dict:
-        """组装传递给播放器的完整参数 dict。"""
         ap = self.active_style
         return {
             "version": core_ust_info.get("version", "未知版本"),
@@ -1174,7 +1229,7 @@ class SettingsManager(QObject):
                 "pitch_curve_color": ap.get("pitch_curve_color", self._pitch_curve_color),
                 "word_lyric_font_family": self.word_lyric_font_family,
                 "info_font_family": self.info_font_family,
-                "styles": list(self._styles),  # 全部样式数据
-                "note_styles": dict(self._note_styles),  # 逐音符样式
+                "styles": list(self._styles),
+                "note_styles": dict(self._note_styles),
             },
         }

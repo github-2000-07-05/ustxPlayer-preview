@@ -410,8 +410,6 @@ class FilePage(QWidget, CardPageMixin):
         if self._pending_notes is not None:
             try:
                 self._s.ustx_notes = self._pending_notes
-                # 如果是 UPLR 导入的延迟解析，恢复 note_styles
-                self._s._apply_deferred_uplr_styles()
             finally:
                 self._pending_notes = None
 

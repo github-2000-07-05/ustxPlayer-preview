@@ -6,7 +6,7 @@ from typing import Optional, Callable
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFileDialog, QFrame,
+    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFileDialog, QFrame, QDialog,
 )
 
 from qfluentwidgets import (
@@ -191,18 +191,37 @@ class BasicPage(QWidget, CardPageMixin):
             self._sync_ui_from_settings()
 
     def _on_export(self):
+        # 先弹出导出模式选择弹窗（BETA 功能）
+        from ui.export_mode_dialog import ExportModeDialog
+        mode_dialog = ExportModeDialog(parent=self.window())
+        if mode_dialog.exec() != QDialog.DialogCode.Accepted:
+            return  # 用户取消
+
+        export_mode = mode_dialog.chosen_mode  # "normal" | "compact"
+
+        # 根据模式设置默认文件名后缀
+        if export_mode == "compact":
+            default_name = (self._s.project_name or "未命名") + "_精简"
+        else:
+            default_name = self._s.project_name or "未命名"
+
         file_path, _ = QFileDialog.getSaveFileName(
             self, "导出你的工程文件",
-            os.path.join(self._s.last_export_dir, self._s.project_name or "未命名"),
+            os.path.join(self._s.last_export_dir, default_name),
             "ustxPlayer-preview工程文件 (*.uplr);;所有文件 (*.*)",
         )
         if not file_path:
             return
         try:
-            self._s.export_uplr(file_path)
+            if export_mode == "compact":
+                self._s.export_uplr_compact(file_path)
+            else:
+                self._s.export_uplr(file_path)
             self._s.last_export_dir = os.path.dirname(file_path)
             self._s.write_settings()
-            InfoBar.success("成功", f"工程已导出到：{file_path}", orient=Qt.Orientation.Vertical, duration=2000,
+            mode_label = "精简" if export_mode == "compact" else ""
+            InfoBar.success("成功", f"工程已{mode_label}导出到：{file_path}",
+                            orient=Qt.Orientation.Vertical, duration=2000,
                             parent=self.window(), position=InfoBarPosition.TOP_RIGHT)
         except Exception as e:
             logger.exception("导出失败")
