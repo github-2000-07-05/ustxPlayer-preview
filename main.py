@@ -288,40 +288,39 @@ class MainWindow(FluentWindow):
         ustx_path = self._settings.ustx_path.strip()
         logger.info(f"Play 按钮点击，USTX路径: {ustx_path}")
 
-        if not ustx_path or not os.path.exists(ustx_path):
-            logger.warning(f"文件无效: {ustx_path}")
+        # 优先使用内存缓存（精简导入或普通导入后已解析到内存）
+        cached = self._settings.cached_ust_info
+        if cached and cached.get("info"):
+            core_ust_info = cached["info"]
+            logger.info("使用内存缓存的解析结果")
+        elif ustx_path and os.path.exists(ustx_path):
+            # 无缓存但有文件：从文件解析
+            tracks = ur.get_ustx_tracks(ustx_path)
+            track_index = None
+            if len(tracks) > 1:
+                dialog = TrackSelectDialog(tracks, parent=self)
+                if dialog.exec() != QDialog.DialogCode.Accepted:
+                    return
+                track_index = dialog.selected_index()
+            core_ust_info = ur.get_ustx_info(ustx_path, track_index=track_index)
+            self._settings.cached_ust_info = {"path": ustx_path, "info": core_ust_info}
+        else:
+            logger.warning(f"无可用数据: ustx_path={ustx_path}, cached={cached is not None}")
             InfoBar.error(
-                "ERcode001", "请选择有效的USTX文件！",
+                "ERcode001", "请先选择有效的USTX文件或导入工程！",
                 orient=Qt.Orientation.Vertical, duration=3000, parent=self, position=InfoBarPosition.TOP_RIGHT,
             )
             return
 
-        try:
-            # 优先复用解析缓存（path 一致时），否则同步解析并刷新缓存
-            cached = self._settings.cached_ust_info
-            if cached and cached.get("path") == ustx_path and cached.get("info"):
-                core_ust_info = cached["info"]
-                logger.info("复用 file_page 解析缓存")
-            else:
-                # 无缓存：先检测音轨，多条可解析音轨时弹出选择窗口
-                tracks = ur.get_ustx_tracks(ustx_path)
-                track_index = None
-                if len(tracks) > 1:
-                    dialog = TrackSelectDialog(tracks, parent=self)
-                    if dialog.exec() != QDialog.DialogCode.Accepted:
-                        # 用户取消 → 中止本次播放
-                        return
-                    track_index = dialog.selected_index()
-                core_ust_info = ur.get_ustx_info(ustx_path, track_index=track_index)
-                self._settings.cached_ust_info = {"path": ustx_path, "info": core_ust_info}
-            # get_ustx_info 返回联合类型，用 isinstance 收窄到 list 后再取 len
-            _notes = core_ust_info.get('notes', [])
-            logger.info(
-                f"解析完成 - 版本={core_ust_info.get('version')}, "
-                f"BPM={core_ust_info.get('tempo')}, "
-                f"音符数={len(_notes) if isinstance(_notes, list) else 0}"
-            )
+        # get_ustx_info 返回联合类型，用 isinstance 收窄到 list 后再取 len
+        _notes = core_ust_info.get('notes', [])
+        logger.info(
+            f"解析完成 - 版本={core_ust_info.get('version')}, "
+            f"BPM={core_ust_info.get('tempo')}, "
+            f"音符数={len(_notes) if isinstance(_notes, list) else 0}"
+        )
 
+        try:
             ust_info = self._settings.build_ust_info(core_ust_info)
 
             # 播放确认：启动播放器 / 导出为 MP4 / 取消
@@ -496,23 +495,20 @@ class MainWindow(FluentWindow):
         self.file_page._on_match()
 
     def _do_uplr_drop(self, file_path: str):
-        """UPLR 拖入延迟执行：导入 → 写配置 → 同步页面 → 后台解析 USTX。
+        """UPLR 拖入延迟执行：导入 → 写配置 → 同步页面。
 
-        在 InfoBar 动画播放完毕后执行，避免 import_uplr 的 JSON 反序列化、
-        缓存写入等操作阻塞 UI 动画。
+        import_uplr 已将数据直接加载到内存（cached_ust_info + ustx_notes），
+        无需再调用 file_page._on_match() 重新解析。
         """
         try:
             self._settings.import_uplr(file_path, parse_ustx=False)
             self._settings.last_open_dir = os.path.dirname(file_path)
             self._settings.write_settings()
             self._sync_all_pages()
-            self.file_page._on_match()
         except ProjectFileMissingError as e:
-            # 配置已加载到内存，仅文件路径无效：同步 UI 供用户重新选择文件
             self._settings.last_open_dir = os.path.dirname(file_path)
             self._settings.write_settings()
             self._sync_all_pages()
-            self.file_page._on_match()
             InfoBar.error("ERcode006", f"工程已加载，但以下文件路径无效：\n{e}",
                           orient=Qt.Orientation.Vertical, duration=5000, parent=self, position=InfoBarPosition.TOP_RIGHT)
         except Exception as e:
@@ -632,9 +628,8 @@ def main():
     splash.set_message("启动完成")
     splash.finish(on_fade_out=_show_main_window)
 
-    # 退出时清理：先停止 file_page 后台解析线程，再清空缓存目录
+    # 退出时清理：停止 file_page 后台解析线程
     app.aboutToQuit.connect(window.file_page.cleanup_parse_thread)
-    app.aboutToQuit.connect(window._settings.clear_cache)
 
     sys.exit(app.exec())
 
