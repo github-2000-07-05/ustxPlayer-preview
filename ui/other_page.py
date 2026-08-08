@@ -20,7 +20,7 @@ from ui.card_mixin import CardPageMixin
 try:
     from main import APP_VERSION
 except ImportError:
-    APP_VERSION = "v26h07"
+    APP_VERSION = "v26h8"
 
 
 class OtherPage(QWidget, CardPageMixin):
@@ -153,11 +153,11 @@ class OtherPage(QWidget, CardPageMixin):
         # 最后一行：协议说明 + 两个协议按钮（GUI 内弹出对话框查看全文）
         lic_row = QHBoxLayout()
         lic_row.setSpacing(12)
-        lic_row.addWidget(BodyLabel("本项目使用 GNU LGPL v3.0 协议，并遵循上游使用协议："))
+        lic_row.addWidget(BodyLabel("本项目使用 GNU GPL v3.0 协议，并遵循上游使用协议："))
         self.terms_btn = PushButton("上游使用协议")
         self.terms_btn.clicked.connect(self._show_terms)
         lic_row.addWidget(self.terms_btn)
-        self.license_btn = PushButton("GNU LGPL v3.0")
+        self.license_btn = PushButton("GNU GPL v3.0")
         self.license_btn.clicked.connect(self._show_license)
         lic_row.addWidget(self.license_btn)
         lic_row.addStretch()
@@ -277,10 +277,10 @@ class OtherPage(QWidget, CardPageMixin):
         dialog.exec()
 
     def _show_license(self):
-        """打开 GNU LGPL v3.0 许可协议（LICENSE），GUI 内查看。"""
+        """打开 GNU GPL v3.0 许可协议（LICENSE），GUI 内查看。"""
         from ui.license_dialog import LicenseDialog
         dialog = LicenseDialog(
-            self.window(), title="GNU LGPL v3.0 许可协议",
+            self.window(), title="GNU GPL v3.0 许可协议",
             path=self._s.license_file_path, encodings=["utf-8", "gbk"],
             default_text="（未找到 LICENSE 文件）",
         )

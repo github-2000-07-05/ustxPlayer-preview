@@ -1,13 +1,38 @@
 # render_export_page.py — 渲染导出页面（复用主窗口内容区）
 """渲染导出设置 + 进度页面，嵌入主窗口而非独立弹窗。
 
+布局：
+    ┌─────────────────────────────────────────────────┐
+    │  [← 返回]  渲染导出                              │
+    ├──────────────────────┬──────────────────────────┤
+    │  左栏：配置卡片       │  右栏：状态卡片           │
+    │  ┌────────────────┐  │  ┌────────────────────┐  │
+    │  │ 输出参数         │  │  │ 状态               │  │
+    │  │ (分辨率/帧率/路径)│  │  │ (进度条/阶段/百分比)│  │
+    │  └────────────────┘  │  └────────────────────┘  │
+    │  ┌────────────────┐  │  ┌────────────────────┐  │
+    │  │ 硬件信息         │  │  │ 操作               │  │
+    │  │ (GPU/编码器/显存)│  │  │ (开始/重新生成/打开)│  │
+    │  └────────────────┘  │  └────────────────────┘  │
+    │  ┌────────────────┐  │  ┌────────────────────┐  │
+    │  │ 渲染后端         │  │  │ 错误信息           │  │
+    │  └────────────────┘  │  │ (错误/日志按钮)     │  │
+    │  ┌────────────────┐  │  └────────────────────┘  │
+    │  │ 预估             │  │                         │
+    │  └────────────────┘  │                         │
+    └──────────────────────┴──────────────────────────┘
+
 包含：
     输出分辨率 / 输出帧率（均含自定义选项）/ 输出路径
     硬件信息 (GPU/编码器/显存)
-    渲染模式 (渲染完再编码 / 边渲染边编码 / 自动)
     渲染后端 (自动 / CUDA / OpenGL / CPU，按硬件可用性禁用并说明原因)
     预估 (唯一帧 / 渲染并发 / 编码并发 / 预估耗时)
     进度条 + 阶段文字 + 失败原因 + 日志文件打开按钮
+
+说明：
+    渲染/编码方案已固定为「唯一帧 I 帧重复」：
+    只编码去重后的唯一帧（-g 1 每帧 IDR），再在 H.264 比特流层面
+    按帧数重复，编码量 = 唯一帧数，不再提供模式选择。
 """
 
 import os
@@ -39,6 +64,7 @@ from core.renderer import (
     get_last_render_error, clear_last_render_error,
     clear_renderer_cache,
 )
+from ui.card_mixin import CardPageMixin
 
 # 常见分辨率选项（末尾追加"自定义"）
 RESOLUTIONS = [
@@ -49,16 +75,18 @@ RESOLUTIONS = [
 ]
 FPS_OPTIONS = [30, 60, 90, 120]
 
-# 各后端单帧渲染经验耗时（秒，1080P 量级）
-BACKEND_FRAME_TIME = {"cuda": 0.006, "opengl": 0.015, "cpu": 0.05}
+# 各后端单帧渲染经验耗时（秒，1080P 量级，多流并行下）
+# CUDA 使用 GPU 计算核心多流并行，单帧极快；GLES 单线程，略慢于 CUDA；CPU 单线程较慢
+BACKEND_FRAME_TIME = {"cuda": 0.003, "opengl": 0.008, "cpu": 0.04}
 # 编码耗时系数（相对视频时长）
-ENCODE_COEF = {"h264_nvenc": 0.4, "h264_amf": 0.6, "h264_qsv": 0.6, "libx264": 1.2}
+# NVENC 为硬件编码器，速度极快；AMF/QSV 稍慢；libx264 为纯软件较慢
+ENCODE_COEF = {"h264_nvenc": 0.12, "h264_amf": 0.25, "h264_qsv": 0.25, "libx264": 0.8}
 
 
 class _RenderWorker(QObject):
     """后台渲染载体。QObject 信号跨线程 emit 自动排队到主线程，线程安全。"""
 
-    progress = Signal(int, int, str)
+    progress = Signal(int, str)
     finished = Signal(bool, str, str)  # (ok, output_path, error_message)
 
     def __init__(self, ust_info, output_path, fps, w, h, mode, backend):
@@ -72,8 +100,8 @@ class _RenderWorker(QObject):
         self._backend = backend
 
     def run(self):
-        def cb(current, total, stage):
-            self.progress.emit(current, total, stage)
+        def cb(pct: int, stage: str):
+            self.progress.emit(pct, stage)
 
         error = ""
         try:
@@ -92,8 +120,15 @@ class _RenderWorker(QObject):
         self.finished.emit(ok, self._output_path, error)
 
 
-class RenderExportPage(QWidget):
-    """渲染导出页面 — 作为主窗口导航页面复用主窗口内容区展示。"""
+class RenderExportPage(QWidget, CardPageMixin):
+    """渲染导出页面 — 作为主窗口导航页面复用主窗口内容区展示。
+
+    左右分栏 + 卡片布局：
+        左栏：输出参数、硬件信息、渲染后端、预估
+        右栏：状态（进度）、操作（按钮）、错误信息
+    """
+
+    _card_border_radius = 10
 
     def __init__(self, ust_info: dict, main_window: QWidget,
                  settings=None):
@@ -132,6 +167,7 @@ class RenderExportPage(QWidget):
         self._estim_timer.timeout.connect(self._refresh_estimates)
 
         self._build_ui()
+        self._apply_card_theme()
         self._refresh_estimates()
 
     # ===================== UI 构建 =====================
@@ -144,15 +180,27 @@ class RenderExportPage(QWidget):
         # ---- 标题行 + 返回 ----
         title_row = QHBoxLayout()
         title_row.setSpacing(8)
-        title_row.addWidget(StrongBodyLabel("渲染导出"))
-        title_row.addStretch()
-        back_btn = PushButton("返回")
+        back_btn = PushButton("← 返回")
         back_btn.clicked.connect(self._on_back)
         title_row.addWidget(back_btn)
+        title_lbl = StrongBodyLabel("渲染导出")
+        title_lbl.setStyleSheet("font-size: 16px;")
+        title_row.addWidget(title_lbl)
+        title_row.addStretch()
         layout.addLayout(title_row)
 
-        # ---- 输出参数 ----
-        layout.addWidget(StrongBodyLabel("输出参数"))
+        # ---- 左右分栏容器 ----
+        split_row = QHBoxLayout()
+        split_row.setSpacing(12)
+
+        # ====== 左栏：配置卡片 ======
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(8)
+
+        # --- 卡片：输出参数 ---
+        out_card, out_layout = self._create_section_card("输出参数")
 
         # 分辨率
         res_row = QHBoxLayout()
@@ -164,26 +212,29 @@ class RenderExportPage(QWidget):
         self.res_combo.addItem("自定义")
         self.res_combo.setCurrentIndex(1)  # 默认 1080P
         self.res_combo.currentIndexChanged.connect(self._on_res_changed)
-        res_row.addWidget(self.res_combo)
-        res_row.addWidget(BodyLabel("宽:"))
+        res_row.addWidget(self.res_combo, 1)
+        out_layout.addLayout(res_row)
+
+        # 自定义宽高
+        custom_size_row = QHBoxLayout()
+        custom_size_row.setSpacing(8)
+        custom_size_row.addWidget(BodyLabel("宽:"))
         self.custom_w = QSpinBox()
         self.custom_w.setRange(320, 7680)
         self.custom_w.setValue(1920)
         self.custom_w.setSingleStep(160)
         self.custom_w.setSuffix(" px")
         self.custom_w.valueChanged.connect(self._schedule_refresh)
-        res_row.addWidget(self.custom_w)
-        res_row.addWidget(BodyLabel("高:"))
+        custom_size_row.addWidget(self.custom_w, 1)
+        custom_size_row.addWidget(BodyLabel("高:"))
         self.custom_h = QSpinBox()
         self.custom_h.setRange(240, 4320)
         self.custom_h.setValue(1080)
         self.custom_h.setSingleStep(90)
         self.custom_h.setSuffix(" px")
         self.custom_h.valueChanged.connect(self._schedule_refresh)
-        res_row.addWidget(self.custom_h)
-        res_row.addStretch()
-        layout.addLayout(res_row)
-        # 仅在选择"自定义"时显示宽高输入框
+        custom_size_row.addWidget(self.custom_h, 1)
+        out_layout.addLayout(custom_size_row)
         self.custom_w.setVisible(False)
         self.custom_h.setVisible(False)
 
@@ -197,16 +248,14 @@ class RenderExportPage(QWidget):
         self.fps_combo.addItem("自定义")
         self.fps_combo.setCurrentIndex(1)  # 默认 60
         self.fps_combo.currentIndexChanged.connect(self._on_fps_changed)
-        fps_row.addWidget(self.fps_combo)
+        fps_row.addWidget(self.fps_combo, 1)
         self.custom_fps = QSpinBox()
         self.custom_fps.setRange(1, 240)
         self.custom_fps.setValue(60)
         self.custom_fps.setSuffix(" fps")
         self.custom_fps.valueChanged.connect(self._schedule_refresh)
         fps_row.addWidget(self.custom_fps)
-        fps_row.addStretch()
-        layout.addLayout(fps_row)
-        # 仅在选择"自定义"时显示帧率输入框
+        out_layout.addLayout(fps_row)
         self.custom_fps.setVisible(False)
 
         # 输出路径
@@ -220,10 +269,12 @@ class RenderExportPage(QWidget):
         browse_btn = PushButton("浏览...")
         browse_btn.clicked.connect(self._on_browse)
         path_row.addWidget(browse_btn)
-        layout.addLayout(path_row)
+        out_layout.addLayout(path_row)
 
-        # ---- 硬件信息 ----
-        layout.addWidget(StrongBodyLabel("硬件信息"))
+        left_layout.addWidget(out_card)
+
+        # --- 卡片：硬件信息 ---
+        hw_card, hw_layout = self._create_section_card("硬件信息")
         hw = self._hw
         if hw.has_gpu:
             gpu_line = f"GPU: {hw.gpu_name}"
@@ -244,96 +295,128 @@ class RenderExportPage(QWidget):
             f"编码器: {encoder_desc}\n"
             f"{vram_line}"
         )
-        layout.addWidget(self.hw_label)
+        self.hw_label.setWordWrap(True)
+        hw_layout.addWidget(self.hw_label)
+        left_layout.addWidget(hw_card)
 
-        # ---- 渲染模式（下拉框，默认自动选择） ----
-        layout.addWidget(StrongBodyLabel("渲染模式"))
-        mode_row = QHBoxLayout()
-        self.mode_combo = ComboBox()
-        self.mode_combo.addItem("自动选择", "auto")
-        self.mode_combo.addItem("渲染完再编码", "batch")
-        self.mode_combo.addItem("边渲染边编码", "stream")
-        self.mode_combo.setCurrentIndex(0)
-        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
-        mode_row.addWidget(self.mode_combo, 1)
-        layout.addLayout(mode_row)
-        self._batch_hint = BodyLabel("")
-        self._batch_hint.setStyleSheet("color: #888888;")
-        self._batch_hint.setWordWrap(True)
-        layout.addWidget(self._batch_hint)
-        self._batch_disabled = False
+        # --- 卡片：渲染后端 ---
+        backend_card, backend_layout = self._create_section_card("渲染后端")
 
-        # ---- 渲染后端（下拉框，默认自动选择） ----
-        layout.addWidget(StrongBodyLabel("渲染后端"))
-        backend_row = QHBoxLayout()
         self.backend_combo = ComboBox()
-        self.backend_combo.addItem("自动选择", "auto")
-        self.backend_combo.addItem("CUDA (NVIDIA)", "cuda")
-        self.backend_combo.addItem("OpenGL", "opengl")
-        self.backend_combo.addItem("CPU (兼容)", "cpu")
+        self.backend_combo.addItem("自动选择", userData="auto")
+        self.backend_combo.addItem("CUDA (NVIDIA)", userData="cuda")
+        self.backend_combo.addItem("OpenGL (通用)", userData="opengl")
+        self.backend_combo.addItem("CPU (兼容)", userData="cpu")
         self.backend_combo.setCurrentIndex(0)
         self.backend_combo.currentIndexChanged.connect(self._schedule_refresh)
-        backend_row.addWidget(self.backend_combo, 1)
-        layout.addLayout(backend_row)
+        backend_layout.addWidget(self.backend_combo)
+
         self._backend_hint = BodyLabel("")
-        self._backend_hint.setStyleSheet("color: #888888;")
         self._backend_hint.setWordWrap(True)
-        layout.addWidget(self._backend_hint)
+        backend_layout.addWidget(self._backend_hint)
+        left_layout.addWidget(backend_card)
 
-        # ---- 预估 ----
-        layout.addWidget(StrongBodyLabel("预估"))
-        self.estimate_label = BodyLabel("")
-        layout.addWidget(self.estimate_label)
+        left_layout.addStretch()
 
-        layout.addStretch()
+        # ====== 右栏：状态卡片 ======
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(8)
 
-        # ---- 操作区 ----
-        self.start_btn = PrimaryPushButton("开始渲染")
-        self.start_btn.clicked.connect(self._on_start)
-        layout.addWidget(self.start_btn)
+        # --- 卡片：状态（进度） ---
+        status_card, status_layout = self._create_section_card("状态")
 
-        # 阶段标签
+        # 阶段标签（大号加粗）
         self.phase_label = BodyLabel("")
-        self.phase_label.setVisible(False)
         font = self.phase_label.font()
-        font.setPointSize(14)
+        font.setPointSize(16)
         font.setBold(True)
         self.phase_label.setFont(font)
-        layout.addWidget(self.phase_label)
+        self.phase_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.phase_label.setVisible(False)
+        status_layout.addWidget(self.phase_label)
 
+        # 进度条
         self.progress_bar = ProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(False)
-        layout.addWidget(self.progress_bar)
+        self.progress_bar.setMinimumHeight(8)
+        status_layout.addWidget(self.progress_bar)
 
+        # 百分比文字
         self.stage_label = BodyLabel("")
+        self.stage_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.stage_label.setVisible(False)
-        layout.addWidget(self.stage_label)
+        status_layout.addWidget(self.stage_label)
 
-        self.error_label = BodyLabel("")
-        self.error_label.setWordWrap(True)
-        self.error_label.setStyleSheet("color: #c42b1c;")
-        self.error_label.setVisible(False)
-        layout.addWidget(self.error_label)
+        # 提示文字（未开始渲染时显示）
+        self.idle_hint = BodyLabel("调整左侧参数后，点击「开始渲染」导出视频")
+        self.idle_hint.setWordWrap(True)
+        self.idle_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.idle_hint.setStyleSheet("color: #888888; padding: 20px 0;")
+        status_layout.addWidget(self.idle_hint)
 
-        self.log_btn = PushButton("")
-        self.log_btn.clicked.connect(self._open_log)
-        self.log_btn.setVisible(False)
-        layout.addWidget(self.log_btn)
+        status_layout.addStretch()
+        right_layout.addWidget(status_card)
 
-        # 成功后的两个按钮
+        # --- 卡片：操作 ---
+        action_card, action_layout = self._create_section_card("操作")
+
+        self.start_btn = PrimaryPushButton("开始渲染")
+        self.start_btn.setMinimumHeight(40)
+        self.start_btn.clicked.connect(self._on_start)
+        action_layout.addWidget(self.start_btn)
+
         self.regenerate_btn = PrimaryPushButton("重新生成")
         self.regenerate_btn.clicked.connect(self._on_regenerate)
         self.regenerate_btn.setVisible(False)
-        layout.addWidget(self.regenerate_btn)
+        action_layout.addWidget(self.regenerate_btn)
 
         self.open_video_btn = PushButton("打开视频文件")
         self.open_video_btn.clicked.connect(self._on_open_video)
         self.open_video_btn.setVisible(False)
-        layout.addWidget(self.open_video_btn)
+        action_layout.addWidget(self.open_video_btn)
 
+        right_layout.addWidget(action_card)
+
+        # --- 卡片：预估 ---
+        est_card, est_layout = self._create_section_card("预估")
+        self.estimate_label = BodyLabel("")
+        self.estimate_label.setWordWrap(True)
+        est_layout.addWidget(self.estimate_label)
+        right_layout.addWidget(est_card)
+
+        # --- 卡片：错误信息 ---
+        error_card, error_layout = self._create_section_card("错误信息")
+
+        self.error_label = BodyLabel("")
+        self.error_label.setWordWrap(True)
+        error_layout.addWidget(self.error_label)
+
+        self.log_btn = PushButton("")
+        self.log_btn.clicked.connect(self._open_log)
+        error_layout.addWidget(self.log_btn)
+
+        # 默认隐藏错误卡片
+        self._set_error_card_visible(False)
+        right_layout.addWidget(error_card)
+
+        right_layout.addStretch()
+
+        # ====== 组装左右分栏 ======
+        split_row.addWidget(left_panel, 3)  # 左栏 60%
+        split_row.addWidget(right_panel, 2)  # 右栏 40%
+        layout.addLayout(split_row, 1)
+
+        # 后端可用性提示
         self._apply_backend_availability()
+
+    def _set_error_card_visible(self, visible: bool):
+        """显示/隐藏错误卡片内容。"""
+        self.error_label.setVisible(visible)
+        self.log_btn.setVisible(visible)
 
     # ===================== 参数解析 =====================
 
@@ -354,10 +437,12 @@ class RenderExportPage(QWidget):
         return self.custom_fps.value()
 
     def _current_mode(self) -> str:
-        return self.mode_combo.currentData()
+        """渲染/编码方案已固定为「逐帧渲染 + 逐帧编码」（不做去重）。"""
+        return "frame_by_frame"
 
     def _current_backend(self) -> str:
-        return self.backend_combo.currentData()
+        data = self.backend_combo.currentData()
+        return data if data else "auto"
 
     def _default_export_dir(self) -> str:
         """输出目录：优先 settings.last_export_dir，否则桌面。"""
@@ -426,16 +511,6 @@ class RenderExportPage(QWidget):
 
     # ===================== 预估刷新（防抖） =====================
 
-    def _on_mode_changed(self, index: int):
-        """拦截被禁用的 batch 选项，弹回自动选择。"""
-        if index == 1 and self._batch_disabled:
-            # 用户尝试选择被禁用的「渲染完再编码」，弹回自动选择
-            self.mode_combo.blockSignals(True)
-            self.mode_combo.setCurrentIndex(0)
-            self.mode_combo.blockSignals(False)
-            return
-        self._schedule_refresh()
-
     def _schedule_refresh(self):
         """延迟触发预估刷新，避免预计算阻塞 UI。"""
         self._estim_timer.start()
@@ -447,62 +522,54 @@ class RenderExportPage(QWidget):
         hw = self._hw
 
         try:
-            states = precompute_frame_states(self._ust_info, fps, w, h)
+            frame_states = precompute_frame_states(self._ust_info, fps, w, h)
         except Exception:
             logger.exception("预计算失败")
             self.estimate_label.setText("预估失败")
             return
 
-        unique = len(states)
-        total_frames = sum(s.frame_count for s in states)
+        state_count = len(frame_states)
+        total_frames = sum(s.frame_count for s in frame_states)
         duration_s = total_frames / fps if fps else 0
 
-        wc = calc_optimal_workers(hw, unique, w, h)
-
-        # ---- 模式可用性 ----
-        total_volume = unique * wc.per_frame_gb
-        batch_ok = hw.vram_usable_gb > 0 and total_volume <= hw.vram_usable_gb
-        batch_index = 1  # 0=auto, 1=batch, 2=stream
-        self._batch_disabled = not batch_ok
-        if not batch_ok:
-            need = max(0.0, total_volume - hw.vram_usable_gb)
-            self._batch_hint.setText(
-                f"「渲染完再编码」需要 ≥ {total_volume:.1f}GB 显存"
-                f"（当前 {hw.vram_usable_gb:.2f}GB，不足 {need:.1f}GB），已禁用"
-            )
-            # 修改 batch 项文本，提示不可用
-            if self.mode_combo.itemText(batch_index) != "渲染完再编码 (显存不足)":
-                self.mode_combo.setItemText(batch_index, "渲染完再编码 (显存不足)")
-            # 当前模式被禁用时自动切回"自动选择"
-            if self.mode_combo.currentData() == "batch":
-                self.mode_combo.setCurrentIndex(0)
-        else:
-            self._batch_hint.setText("")
-            if self.mode_combo.itemText(batch_index) != "渲染完再编码":
-                self.mode_combo.setItemText(batch_index, "渲染完再编码")
+        wc = calc_optimal_workers(hw, state_count, w, h)
 
         # ---- 预估耗时 ----
-        backend = self._current_backend()
-        if backend == "auto":
-            backend_name, _ = _select_render_backend(hw, "auto")
-        else:
-            backend_name = backend
+        # 通过 _select_render_backend 获取实际生效的后端（含 fallback 逻辑）
+        backend_name, _ = _select_render_backend(hw, self._current_backend())
         per_frame = BACKEND_FRAME_TIME.get(backend_name, 0.02)
         # 所有后端均多线程并行渲染
-        render_time = unique / max(1, wc.render_streams) * per_frame
-        enc_coef = ENCODE_COEF.get(hw.encoder_name, 1.0)
-        encode_time = duration_s * enc_coef
-        estimate = render_time + encode_time + 1.0  # +1s 预计算/IO 开销
+        render_time = state_count / max(1, wc.render_streams) * per_frame
+
+        # 编码器选择：CPU 后端强制 libx264
+        if backend_name == "cpu":
+            enc_encoder = "libx264"
+        else:
+            enc_encoder = hw.encoder_name
+        enc_coef = ENCODE_COEF.get(enc_encoder, 1.0)
+
+        # 逐帧渲染 + 逐帧编码方案：不做去重，编码量 = 总输出帧数。
+        # 渲染与编码通过生产者-消费者模式并行，总耗时 ≈ max(渲染, 编码)。
+        encode_time = total_frames / max(1, fps) * enc_coef
+        estimate = max(render_time, encode_time) + 1.0
 
         if estimate < 60:
             estimate_str = f"≈ {estimate:.0f} 秒"
         else:
             estimate_str = f"≈ {estimate / 60:.1f} 分钟"
 
+        # 后端名称映射
+        backend_display = {
+            "cuda": "CUDA (NVIDIA)",
+            "opengl": "OpenGL (通用)",
+            "cpu": "CPU (兼容)",
+        }.get(backend_name, backend_name)
+
         self.estimate_label.setText(
-            f"唯一帧: {unique}     输出帧: {total_frames} (≈{duration_s:.0f}s)\n"
+            f"时间区间帧: {state_count}     输出帧: {total_frames} (≈{duration_s:.0f}s)\n"
+            f"渲染后端: {backend_display}    方案: 逐帧编码\n"
             f"渲染并发: {wc.render_streams} stream    编码并发: {wc.encode_workers}\n"
-            f"渲染后端: {backend_name}    预估耗时: {estimate_str}"
+            f"预估耗时: {estimate_str}"
         )
 
     # ===================== 渲染执行 =====================
@@ -532,18 +599,17 @@ class RenderExportPage(QWidget):
 
         self._running = True
         self._last_stage = ""
-        self.start_btn.setEnabled(False)
+        self.idle_hint.setVisible(False)
         self.start_btn.setVisible(False)
         self.regenerate_btn.setVisible(False)
         self.open_video_btn.setVisible(False)
+        self._set_error_card_visible(False)
         self.phase_label.setVisible(True)
         self.phase_label.setText("预计算")
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         self.stage_label.setVisible(True)
-        self.stage_label.setText("")
-        self.error_label.setVisible(False)
-        self.log_btn.setVisible(False)
+        self.stage_label.setText("0%")
 
         # 任务栏进度
         if self._taskbar_progress:
@@ -558,12 +624,11 @@ class RenderExportPage(QWidget):
         self._thread = threading.Thread(target=self._worker.run, daemon=True)
         self._thread.start()
 
-    def _on_progress(self, current: int, total: int, stage: str):
-        """进度回调（主线程）。总进度 0-100，阶段切换只改标签不重置。"""
+    def _on_progress(self, pct: int, stage: str):
+        """进度回调（主线程）。pct 为总进度 0-100，阶段切换只改标签不重置。"""
         if stage != self._last_stage:
             self._last_stage = stage
             self.phase_label.setText(stage)
-        pct = int(current / total * 100) if total > 0 else 0
         if pct > self.progress_bar.value():
             self.progress_bar.setValue(pct)
         self.stage_label.setText(f"{pct}%")
@@ -587,6 +652,7 @@ class RenderExportPage(QWidget):
             self.progress_bar.setVisible(False)
             self.stage_label.setVisible(False)
             self.phase_label.setVisible(False)
+            self.idle_hint.setVisible(False)
             self.regenerate_btn.setVisible(True)
             self.open_video_btn.setVisible(True)
             InfoBar.success("成功", f"视频已导出到：{output_path}",
@@ -597,12 +663,10 @@ class RenderExportPage(QWidget):
             detail = error_msg.strip() or "未知错误，详情见日志"
             self.phase_label.setText("失败")
             self.stage_label.setText("渲染失败")
-            self.error_label.setText(f"渲染失败（ERcode012）：{detail}")
-            self.error_label.setVisible(True)
-            self.log_btn.setText(f"打开日志文件（{log_path}）")
-            self.log_btn.setVisible(True)
+            self.error_label.setText(f"渲染失败：{detail}")
+            self._set_error_card_visible(True)
+            self.log_btn.setText(f"打开日志文件")
             self.start_btn.setVisible(True)
-            self.start_btn.setEnabled(True)
             InfoBar.error("ERcode012", f"渲染导出失败，日志：{log_path}",
                           orient=Qt.Orientation.Vertical, duration=5000,
                           parent=self._main_window, position=InfoBarPosition.TOP_RIGHT)
@@ -614,11 +678,12 @@ class RenderExportPage(QWidget):
         self.regenerate_btn.setVisible(False)
         self.open_video_btn.setVisible(False)
         self.start_btn.setVisible(True)
-        self.start_btn.setEnabled(True)
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(False)
         self.phase_label.setVisible(False)
         self.stage_label.setVisible(False)
+        self._set_error_card_visible(False)
+        self.idle_hint.setVisible(True)
         self._last_stage = ""
 
     def _cleanup_render_resources(self):
@@ -685,13 +750,12 @@ class RenderExportPage(QWidget):
         self._running = False
         self._last_stage = ""
         self.start_btn.setVisible(True)
-        self.start_btn.setEnabled(True)
         self.regenerate_btn.setVisible(False)
         self.open_video_btn.setVisible(False)
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(False)
         self.phase_label.setVisible(False)
         self.stage_label.setVisible(False)
-        self.error_label.setVisible(False)
-        self.log_btn.setVisible(False)
+        self._set_error_card_visible(False)
+        self.idle_hint.setVisible(True)
         self._refresh_estimates()

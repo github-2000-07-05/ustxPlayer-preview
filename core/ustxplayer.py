@@ -21,7 +21,7 @@ from core.log import logger
 try:
     from main import APP_VERSION
 except ImportError:
-    APP_VERSION = "v26h07"
+    APP_VERSION = "v26h8"
 
 
 # ===================== 工具函数 =====================

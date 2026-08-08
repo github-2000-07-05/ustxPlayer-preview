@@ -10,7 +10,7 @@
   用于导入 uplr 工程时避免创建缓存文件
 """
 
-from typing import List, Dict, Union
+from typing import List, Dict, Tuple, Optional, Union
 import os
 
 import yaml
@@ -39,6 +39,43 @@ def _parse_ustx_tracks(data: dict) -> List[Dict]:
             "note_count": len(notes),
         })
     return tracks
+
+
+def _interpolate_envelope(
+    points: List[Tuple[float, float]], tick: float,
+) -> float:
+    """在 per-note pitch 包络点上线性插值，返回 tick 处的偏移值 (cents)。
+
+    Args:
+        points: [(absolute_tick, offset_cents), ...]，按 tick 升序
+        tick: 需要插值的 tick 位置
+
+    Returns:
+        插值后的偏移值 (cents)；tick 超出范围时返回最近端点的值
+    """
+    if not points:
+        return 0.0
+    if len(points) == 1:
+        return points[0][1]
+    # 二分查找 tick 所在的区间
+    lo, hi = 0, len(points) - 1
+    if tick <= points[lo][0]:
+        return points[lo][1]
+    if tick >= points[hi][0]:
+        return points[hi][1]
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if tick < points[mid][0]:
+            hi = mid
+        else:
+            lo = mid
+    # 线性插值
+    x0, y0 = points[lo]
+    x1, y1 = points[hi]
+    if x1 == x0:
+        return y0
+    ratio = (tick - x0) / (x1 - x0)
+    return y0 + ratio * (y1 - y0)
 
 
 def _parse_ustx_info(data: dict, track_index: Union[int, None] = None) -> Dict[str, Union[str, float, int, List[Dict]]]:
@@ -97,6 +134,9 @@ def _parse_ustx_info(data: dict, track_index: Union[int, None] = None) -> Dict[s
             tick_pitch[int(x)] = int(y)
         sorted_ticks = sorted(tick_pitch.keys())
 
+        # 预计算所有正常音符的 per-note pitch 结束值（用于 snap_first）
+        _prev_note_pitch_at_end: Optional[float] = None
+
         for i, note in enumerate(notes):
             note_num = note.get('tone', 0)
             lyric = note.get('lyric', '')
@@ -113,6 +153,57 @@ def _parse_ustx_info(data: dict, track_index: Union[int, None] = None) -> Dict[s
                 pitch_bend = [0]
             elif len(pitch_bend) == 1:
                 pitch_bend = pitch_bend * 2
+
+            # ---- 合并 per-note pitch 数据（转音/过渡音高） ----
+            # USTX 每个音符都包含 pitch.data 定义 per-note 音高包络，
+            # 但旧代码只提取了 voice_part 级别的 pitd 曲线，忽略了 per-note 数据，
+            # 导致过渡音符的转音（portamento）丢失。
+            # 以下将 per-note pitch 包络插值到音符的每个 tick 上，叠加到 pitd 值。
+            note_pitch_data = note.get('pitch')
+            if isinstance(note_pitch_data, dict):
+                pdata = note_pitch_data.get('data', [])
+                snap_first = note_pitch_data.get('snap_first', False)
+                if pdata and isinstance(pdata, list) and len(pdata) >= 2:
+                    # 将 per-note pitch 包络点转换为 (absolute_tick, offset_cents)
+                    note_center = note_pos + duration / 2.0
+                    envelope_points: List[Tuple[float, float]] = []
+                    for pi, pt in enumerate(pdata):
+                        x = pt.get('x', 0)
+                        y = pt.get('y', 0)
+                        abs_tick = note_center + x
+                        if pi == 0 and snap_first and _prev_note_pitch_at_end is not None:
+                            # snap_first: 第一个点的 y 相对前一个音符的结束音高
+                            # 偏移 = (前音符结束音高 - 当前音符基音) + y
+                            cur_base = note_num * 100.0
+                            offset = (_prev_note_pitch_at_end - cur_base) + y
+                        else:
+                            offset = float(y)
+                        envelope_points.append((abs_tick, offset))
+
+                    # 计算前音符结束音高（供下一个音符的 snap_first 使用）
+                    # 包络最后一个点的 offset 相对当前音符基音
+                    if envelope_points:
+                        _prev_note_pitch_at_end = note_num * 100.0 + envelope_points[-1][1]
+
+                    # 将 per-note 包络插值到每个 pitd tick 上，叠加到 pitch_bend
+                    if duration > 0 and len(pitch_bend) > 0 and len(sorted_ticks) > 0:
+                        note_ticks = [t for t in sorted_ticks if note_pos <= t <= note_end]
+                        if note_ticks:
+                            # 对每个 tick 插值 per-note 包络
+                            for ti, tick in enumerate(note_ticks):
+                                # 插值：找到包络上 tick 左右的两个点
+                                offset = _interpolate_envelope(envelope_points, tick)
+                                # 叠加到 pitd 值
+                                pitch_bend[ti] = pitch_bend[ti] + int(round(offset))
+                else:
+                    # 没有足够包络点，但仍记录前音符结束音高
+                    if len(pdata) == 1:
+                        _prev_note_pitch_at_end = note_num * 100.0 + pdata[0].get('y', 0)
+            else:
+                # 没有 per-note pitch 数据（极少数情况）
+                # 用 pitd 曲线的最后一个值作为前音符结束音高
+                if pitch_bend:
+                    _prev_note_pitch_at_end = note_num * 100.0 + pitch_bend[-1]
 
             note_list.append({
                 "index": f"{i:04d}",

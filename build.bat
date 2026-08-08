@@ -152,11 +152,11 @@ REM   scipy / pandas / matplotlib / sklearn / PIL / numpy / pytest / PyInstaller
     --windows-console-mode=disable ^
     --output-dir=dist ^
     --company-name="lyrinXD" ^
-    --product-name="ustxPlayer" ^
-    --file-version=26.30.0 ^
-    --product-version=26.30.0 ^
-    --file-description="ustxPlayer - USTX project visualizer" ^
-    --output-filename="ustxPlayer.exe" ^
+    --product-name="ustxPlayer-preview" ^
+    --file-version=26.8.0 ^
+    --product-version=26.8.0 ^
+    --file-description="ustxPlayer-preview - USTX project visualizer" ^
+    --output-filename="ustxPlayer-preview.exe" ^
     --remove-output ^
     main.py
 

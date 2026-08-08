@@ -2,18 +2,19 @@
 """USTX 可视化视频导出系统。
 
 完整管线:
-    ① CPU 预计算所有帧的视觉状态 + 去重
+    ① CPU 预计算所有时间区间帧的视觉状态（不做视觉去重）
     ② 检测硬件 (GPU/NVENC/AMF/QSV)
     ③ 计算最优并发数 (渲染 stream/编码 worker)
-    ④ GPU 多 stream 并行渲染唯一帧 → PNG 落盘
-    ⑤ FFmpeg 帧重复编码 + drawtext 时间注入 + 音频 mux
-    ⑥ 清理临时文件
+    ④ 多线程并行渲染每个时间区间帧 → NV12
+    ⑤ FFmpeg 逐帧真实编码（正常 GOP）
+    ⑥ 音频 mux → 输出 .mp4 + 清理临时文件
 
 对外接口:
     render_video(ust_info, output_path, ...) -> bool
 """
 
 import os
+import queue
 import re
 import time
 import shutil
@@ -25,7 +26,9 @@ from typing import (
     Callable, List, Optional, Tuple, Dict, Any, NamedTuple,
 )
 
-from PySide6.QtCore import Qt, QRectF, QPointF
+import ctypes
+
+from PySide6.QtCore import Qt, QRectF, QPointF, QSize
 from PySide6.QtGui import (
     QPainter, QColor, QFont, QFontMetrics, QPen, QPolygonF,
     QImage, QFontDatabase,
@@ -38,7 +41,7 @@ from core.log import logger
 try:
     from main import APP_VERSION
 except ImportError:
-    APP_VERSION = "v26h07"
+    APP_VERSION = "v26h8"
 
 
 # ===================== 常量 =====================
@@ -48,10 +51,22 @@ NOTE_LINE_WIDTH = 5
 NOTE_ALPHA = 225
 COPYRIGHT_ALPHA = 100
 
-# 硬编码上限
+# 硬编码上限（SM 数动态计算时会覆盖此值）
 MAX_RENDER_STREAMS = 8
 MAX_ENCODE_WORKERS = 2
 MIN_CUDA_CORES_FOR_CUDA = 512  # CUDA 核心数不足此值时禁用 CUDA 渲染
+# NVENC 最快编码预设（离线导出，极致吞吐优先）
+# p1 = 最快；constqp = 恒定量化参数（比 VBR 更简单，省去码率控制开销）
+# bf=0 = 禁用 B 帧（只编 I/P，减少参考帧复杂度）
+# 禁用 AQ/lookahead/scenecut 进一步减少编码器决策开销
+NVENC_FAST_PRESET = "p1"
+NVENC_FAST_OPTS = [
+    "-preset", "p1",
+    "-rc", "constqp", "-qp", "28",
+    "-bf", "0",
+    "-spatial-aq", "0", "-temporal-aq", "0",
+    "-rc-lookahead", "0", "-no-scenecut", "1",
+]
 
 # 多语言 LRC 分组阈值
 _LRC_GROUP_THRESHOLD = 0.020
@@ -138,6 +153,7 @@ class HardwareInfo(NamedTuple):
     gpu_name: str                     # "RTX 3060"
     gpu_vendor: str                   # "nvidia" / "amd" / "intel" / "unknown"
     cuda_cores: int                   # 0 表示无 CUDA 或非 NVIDIA
+    sm_count: int                     # SM 数量（用于 CUDA 流数计算）
     vram_total_gb: float              # 总显存 (GB)
     vram_free_gb: float               # 当前空余 (GB)
     vram_usable_gb: float             # vram_free × 0.85
@@ -342,13 +358,21 @@ def _detect_nvidia() -> Optional[Dict[str, Any]]:
 
         # NVENC 检测
         nvenc_count = gpu_count  # 每张卡 1 个 NVENC（现代显卡）
+        # RTX 40/50 系列有双 NVENC 编码器
+        name_upper = gpu_name.upper()
+        if "RTX 40" in name_upper or "RTX 50" in name_upper or "BLACKWELL" in name_upper or "ADA" in name_upper:
+            nvenc_count = 2
         # 通过 nvidia-smi 或架构名推断 NVENC 代数
         nvenc_gen = _detect_nvenc_generation(gpu_name)
+
+        # SM 数量（从 CuPy 或 CUDA Driver API 获取）
+        sm_count = _query_sm_count()
 
         return {
             "gpu_name": gpu_name,
             "gpu_vendor": "nvidia",
             "cuda_cores": cuda_cores,
+            "sm_count": sm_count,
             "vram_total_gb": vram_total_mb / 1024,
             "vram_free_gb": vram_free_mb / 1024,
             "nvenc_count": nvenc_count,
@@ -407,6 +431,41 @@ def _query_cuda_cores_via_cupy() -> int:
             cores_per_sm = fallback
 
         return sm_count * cores_per_sm
+    except Exception:
+        return 0
+
+
+def _query_sm_count() -> int:
+    """查询 GPU SM 数量（用于 CUDA 流数计算）。
+
+    先尝试 CuPy，失败则用 CUDA Driver API。
+    Returns: SM 数量，失败返回 0
+    """
+    try:
+        import cupy as cp
+        props = cp.cuda.runtime.getDeviceProperties(0)
+        return props['multiProcessorCount']
+    except Exception:
+        pass
+    try:
+        import ctypes
+        import sys
+        if sys.platform == 'win32':
+            lib = ctypes.CDLL('nvcuda.dll')
+        else:
+            lib = ctypes.CDLL('libcuda.so.1')
+        result = lib.cuInit(0)
+        if result != 0:
+            return 0
+        device = ctypes.c_int()
+        result = lib.cuDeviceGet(ctypes.byref(device), 0)
+        if result != 0:
+            return 0
+        sm_count = ctypes.c_int()
+        result = lib.cuDeviceGetAttribute(ctypes.byref(sm_count), 16, device)
+        if result != 0:
+            return 0
+        return sm_count.value
     except Exception:
         return 0
 
@@ -587,13 +646,14 @@ def detect_hardware() -> HardwareInfo:
         if not supports_cuda:
             logger.warning(
                 f"NVIDIA GPU {nvidia['gpu_name']} CUDA 核心数 ({cuda_cores}) "
-                f"不足 {MIN_CUDA_CORES_FOR_CUDA}，禁用 CUDA 渲染，使用 OpenGL 回退"
+                f"不足 {MIN_CUDA_CORES_FOR_CUDA}，禁用 CUDA 渲染，使用 CPU 回退"
             )
 
         return HardwareInfo(
             gpu_name=nvidia["gpu_name"],
             gpu_vendor="nvidia",
             cuda_cores=cuda_cores,
+            sm_count=nvidia["sm_count"],
             vram_total_gb=nvidia["vram_total_gb"],
             vram_free_gb=vram_free,
             vram_usable_gb=vram_usable,
@@ -612,6 +672,7 @@ def detect_hardware() -> HardwareInfo:
             gpu_name=amd["gpu_name"],
             gpu_vendor="amd",
             cuda_cores=0,
+            sm_count=0,
             vram_total_gb=0,
             vram_free_gb=0,
             vram_usable_gb=0,
@@ -630,6 +691,7 @@ def detect_hardware() -> HardwareInfo:
             gpu_name=intel["gpu_name"],
             gpu_vendor="intel",
             cuda_cores=0,
+            sm_count=0,
             vram_total_gb=0,
             vram_free_gb=0,
             vram_usable_gb=0,
@@ -646,6 +708,7 @@ def detect_hardware() -> HardwareInfo:
         gpu_name="CPU (Software)",
         gpu_vendor="cpu",
         cuda_cores=0,
+        sm_count=0,
         vram_total_gb=0,
         vram_free_gb=0,
         vram_usable_gb=0,
@@ -661,14 +724,14 @@ def detect_hardware() -> HardwareInfo:
 
 
 def calc_optimal_workers(
-    hw: HardwareInfo, unique_frames: int, width: int, height: int,
+    hw: HardwareInfo, frame_states_count: int, width: int, height: int,
 ) -> WorkerConfig:
     """三约束取最小，算出最优并发数。
 
     约束:
       a) CUDA 核心数，每 stream 至少 512 核
       b) 显存，每 stream 需 overhead(0.15GB) + 1帧buffer
-      c) 任务量，不超过唯一帧数 1/10
+      c) 任务量，不超过时间区间帧数 1/10
     """
     per_frame_gb = (width * height * 4) / (1024 ** 3)
 
@@ -676,7 +739,7 @@ def calc_optimal_workers(
     if hw.supports_cuda_render and hw.cuda_cores > 0:
         max_by_cores = max(1, hw.cuda_cores // 512)
     else:
-        max_by_cores = max(1, os.cpu_count() or 4)  # CPU/OpenGL 用 CPU 核心数
+        max_by_cores = max(1, os.cpu_count() or 4)  # CPU 用 CPU 核心数
 
     if hw.vram_usable_gb > 0:
         max_by_vram = max(1, int(hw.vram_usable_gb / (VRAM_OVERHEAD_PER_STREAM + per_frame_gb)))
@@ -684,24 +747,24 @@ def calc_optimal_workers(
         # 无显存信息时（AMD/Intel/CPU），使用 CPU 核心数
         max_by_vram = max(1, os.cpu_count() or 4)
 
-    max_by_task = max(1, unique_frames // 10) if unique_frames > 0 else 1
+    max_by_task = max(1, frame_states_count // 10) if frame_states_count > 0 else 1
 
     render_streams = min(max_by_cores, max_by_vram, max_by_task, MAX_RENDER_STREAMS)
 
     # ---- 编码并发数 ----
     if hw.nvenc_count > 0:
-        encode_workers = hw.nvenc_count if unique_frames > 200 else 1
+        encode_workers = hw.nvenc_count if frame_states_count > 200 else 1
     else:
         encode_workers = 1
 
     # ---- 每批渲染帧数 ----
     if hw.vram_usable_gb > 0 and per_frame_gb > 0:
-        batch_size = min(int(hw.vram_usable_gb / per_frame_gb), unique_frames)
+        batch_size = min(int(hw.vram_usable_gb / per_frame_gb), frame_states_count)
     else:
-        batch_size = min(100, unique_frames)  # CPU 无显存限制，但设合理上限
+        batch_size = min(100, frame_states_count)  # CPU 无显存限制，但设合理上限
 
     # ---- 渲染模式判定 ----
-    total_frame_volume = unique_frames * per_frame_gb
+    total_frame_volume = frame_states_count * per_frame_gb
     if hw.vram_usable_gb > 0 and total_frame_volume <= hw.vram_usable_gb:
         default_mode = "batch"  # 全缓存一次编码
     else:
@@ -766,7 +829,7 @@ def precompute_frame_states(
         width, height: 输出分辨率
 
     Returns:
-        去重后的 FrameState 列表，每项代表一个唯一视觉帧
+        时间区间 FrameState 列表（不做视觉去重，转音完整保留）
     """
     notes = ust_info.get("notes", [])
     tempo = ust_info.get("tempo", 120)
@@ -873,11 +936,10 @@ def precompute_frame_states(
     # 构建每个时间段的状态
     states: List[FrameState] = []
     last_valid_lyric = ""
-    last_cache_key = ""
 
-    # 用于去重的缓存
-    seen_cache_keys: Dict[str, int] = {}  # cache_key -> index in states
-
+    # 不做视觉去重：每个时间区间独立生成一帧。
+    # 用户要求「存多少帧就渲染多少帧」——自动去重合并会把
+    # 转音曲线（portamento）不同的相邻区间错误合并，导致转音丢失。
     for i, start_time in enumerate(sorted_times):
         if i + 1 >= len(sorted_times):
             break
@@ -983,32 +1045,8 @@ def precompute_frame_states(
                         s <= start_time <= e for s, e in lrc_hide_intervals
                     )
 
-        # 构建缓存 key
-        cache_parts = [
-            lyric_text, note_name, bg_hex,
-            str(lyric_rgb), str(note_rgb), pitch_curve_hex,
-            str(len(pitch_points)),
-            str(lrc_lines), str(lrc_hidden),
-            song_name, song_author, ust_author,
-            str(show_bpm), str(show_song_name), str(show_song_author),
-            str(show_ust_author), str(show_copyright), str(show_play_time),
-            str(tempo), wff, iff, small_font_color,
-        ]
-        cache_key = "|".join(cache_parts)
-
-        # 去重检测
-        if cache_key in seen_cache_keys:
-            # 合并到已有帧（延长持续时间）
-            prev_idx = seen_cache_keys[cache_key]
-            prev_state = states[prev_idx]
-            new_duration = prev_state.duration + duration
-            new_frame_count = prev_state.frame_count + frame_count
-            # 更新为新的持续时间
-            states[prev_idx] = prev_state._replace(
-                duration=new_duration,
-                frame_count=new_frame_count,
-            )
-            continue
+        # 构建唯一标识（不用于去重，仅用于调试/日志）
+        cache_key = f"t{start_time:.3f}"
 
         state = FrameState(
             lyric=lyric_text,
@@ -1044,13 +1082,12 @@ def precompute_frame_states(
             is_duplicate=False,
             cache_key=cache_key,
         )
-        seen_cache_keys[cache_key] = len(states)
         states.append(state)
 
     logger.info(
-        f"预计算完成: {len(states)} 个唯一帧 "
+        f"预计算完成: {len(states)} 个时间区间 "
         f"(原始 {len(sorted_times)} 个时间点, "
-        f"去重后 {len(states)} 帧)"
+        f"总输出帧 {sum(s.frame_count for s in states)})"
     )
     return states
 
@@ -1087,6 +1124,98 @@ def _find_note_at_tick(
 # ===================== CPU 渲染后端 =====================
 
 
+def _draw_with_painter(
+    painter: QPainter, state: FrameState, width: int, height: int, fonts: dict,
+) -> None:
+    """通用 QPainter 绘制逻辑（CPU 和 GLES 后端共用）。"""
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    cx, cy = width // 2, height // 2
+
+    # ---- 音名 ----
+    if state.show_note_name and state.note_name:
+        note_c = QColor(*state.note_color)
+        note_c.setAlpha(NOTE_ALPHA)
+        painter.setPen(note_c)
+        painter.setFont(fonts["note_font"])
+        fm = fonts["fm_note"]
+        tw = fm.horizontalAdvance(state.note_name)
+        th = fm.height()
+        pad = th * 0.2
+        painter.drawText(
+            QRectF(cx - tw / 2 - pad, cy - th / 2 - pad,
+                   tw + pad * 2, th + pad * 2),
+            Qt.AlignmentFlag.AlignCenter, state.note_name,
+        )
+
+    # ---- 音高线 ----
+    if state.show_curve and state.pitch_points and len(state.pitch_points) >= 2:
+        pen = QPen(QColor(state.pitch_curve_color))
+        pen.setWidth(NOTE_LINE_WIDTH)
+        painter.setPen(pen)
+        points = [QPointF(x, y) for x, y in state.pitch_points]
+        painter.drawPolyline(QPolygonF(points))
+
+    # ---- 歌词 ----
+    if state.show_lyric and state.lyric:
+        lyric_c = QColor(*state.lyric_color)
+        painter.setPen(lyric_c)
+        painter.setFont(fonts["ust_lyric_font"])
+        tw = fonts["fm_ust_lyric"].horizontalAdvance(state.lyric)
+        th = fonts["fm_ust_lyric"].height()
+        pad = th * 0.2
+        painter.drawText(
+            QRectF(cx - tw / 2 - pad, cy - th / 2 - pad,
+                   tw + pad * 2, th + pad * 2),
+            Qt.AlignmentFlag.AlignCenter, state.lyric,
+        )
+
+    # ---- 左上角信息 ----
+    painter.setPen(QColor(state.small_font_color))
+    y_off = 20
+    if state.show_song_name and state.song_name:
+        painter.setFont(fonts["bold_small_font"])
+        painter.drawText(20, y_off + 14, state.song_name)
+        painter.setFont(fonts["small_font"])
+        y_off += 27
+    if state.show_song_author and state.song_author:
+        painter.drawText(20, y_off + 14, state.song_author)
+        y_off += 25
+    if state.show_ust_author and state.ust_author:
+        painter.drawText(20, y_off + 14, state.ust_author)
+
+    # BPM（右上角）
+    if state.show_bpm:
+        painter.setFont(fonts["small_font"])
+        bpm_text = f"BPM={state.tempo}"
+        bpm_w = fonts["fm_small"].horizontalAdvance(bpm_text)
+        painter.drawText(width - 20 - bpm_w, 34, bpm_text)
+
+    # LRC 歌词
+    if state.show_lyric and state.lrc_lines and not state.lrc_hidden:
+        anchor_y = int(height * 0.3) if state.lyric_pos == "上" else int(height * 0.7)
+        painter.setFont(fonts["lyric_font"])
+        line_h = fonts["fm_lyric"].height()
+        step = line_h * 1.3
+        n = len(state.lrc_lines)
+        if state.lyric_pos == "上":
+            top_baseline = anchor_y - (n - 1) * step
+        else:
+            top_baseline = anchor_y
+        for li, text in enumerate(state.lrc_lines):
+            baseline = int(top_baseline + li * step)
+            text_w = fonts["fm_lyric"].horizontalAdvance(text)
+            painter.drawText(width // 2 - text_w // 2, baseline, text)
+
+    # 版权（底部居中）
+    if state.show_copyright:
+        copy_c = QColor(195, 195, 195)
+        copy_c.setAlpha(COPYRIGHT_ALPHA)
+        painter.setPen(copy_c)
+        painter.setFont(fonts["copyright_font"])
+        copy_w = fonts["fm_copyright"].horizontalAdvance(state.copyright_text)
+        painter.drawText(width // 2 - copy_w // 2, height - 20, state.copyright_text)
+
+
 def _render_frame_cpu(
     state: FrameState, width: int, height: int, fonts: dict,
 ) -> QImage:
@@ -1096,94 +1225,7 @@ def _render_frame_cpu(
 
     painter = QPainter(image)
     try:
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        cx, cy = width // 2, height // 2
-
-        # ---- 音名 ----
-        if state.show_note_name and state.note_name:
-            note_c = QColor(*state.note_color)
-            note_c.setAlpha(NOTE_ALPHA)
-            painter.setPen(note_c)
-            painter.setFont(fonts["note_font"])
-            fm = fonts["fm_note"]
-            tw = fm.horizontalAdvance(state.note_name)
-            th = fm.height()
-            pad = th * 0.2
-            painter.drawText(
-                QRectF(cx - tw / 2 - pad, cy - th / 2 - pad,
-                       tw + pad * 2, th + pad * 2),
-                Qt.AlignmentFlag.AlignCenter, state.note_name,
-            )
-
-        # ---- 音高线 ----
-        if state.show_curve and state.pitch_points and len(state.pitch_points) >= 2:
-            pen = QPen(QColor(state.pitch_curve_color))
-            pen.setWidth(NOTE_LINE_WIDTH)
-            painter.setPen(pen)
-            points = [QPointF(x, y) for x, y in state.pitch_points]
-            painter.drawPolyline(QPolygonF(points))
-
-        # ---- 歌词 ----
-        if state.show_lyric and state.lyric:
-            lyric_c = QColor(*state.lyric_color)
-            painter.setPen(lyric_c)
-            painter.setFont(fonts["ust_lyric_font"])
-            tw = fonts["fm_ust_lyric"].horizontalAdvance(state.lyric)
-            th = fonts["fm_ust_lyric"].height()
-            pad = th * 0.2
-            painter.drawText(
-                QRectF(cx - tw / 2 - pad, cy - th / 2 - pad,
-                       tw + pad * 2, th + pad * 2),
-                Qt.AlignmentFlag.AlignCenter, state.lyric,
-            )
-
-        # ---- 左上角信息 ----
-        painter.setPen(QColor(state.small_font_color))
-        y_off = 20
-        if state.show_song_name and state.song_name:
-            painter.setFont(fonts["bold_small_font"])
-            painter.drawText(20, y_off + 14, state.song_name)
-            painter.setFont(fonts["small_font"])
-            y_off += 27
-        if state.show_song_author and state.song_author:
-            painter.drawText(20, y_off + 14, state.song_author)
-            y_off += 25
-        if state.show_ust_author and state.ust_author:
-            painter.drawText(20, y_off + 14, state.ust_author)
-
-        # BPM（右上角）
-        if state.show_bpm:
-            painter.setFont(fonts["small_font"])
-            bpm_text = f"BPM={state.tempo}"
-            bpm_w = fonts["fm_small"].horizontalAdvance(bpm_text)
-            painter.drawText(width - 20 - bpm_w, 34, bpm_text)
-
-        # LRC 歌词
-        if state.show_lyric and state.lrc_lines and not state.lrc_hidden:
-            anchor_y = int(height * 0.3) if state.lyric_pos == "上" else int(height * 0.7)
-            painter.setFont(fonts["lyric_font"])
-            line_h = fonts["fm_lyric"].height()
-            step = line_h * 1.3
-            n = len(state.lrc_lines)
-            if state.lyric_pos == "上":
-                top_baseline = anchor_y - (n - 1) * step
-            else:
-                top_baseline = anchor_y
-            for li, text in enumerate(state.lrc_lines):
-                baseline = int(top_baseline + li * step)
-                text_w = fonts["fm_lyric"].horizontalAdvance(text)
-                painter.drawText(width // 2 - text_w // 2, baseline, text)
-
-        # 版权（底部居中）
-        if state.show_copyright:
-            copy_c = QColor(195, 195, 195)
-            copy_c.setAlpha(COPYRIGHT_ALPHA)
-            painter.setPen(copy_c)
-            painter.setFont(fonts["copyright_font"])
-            copy_w = fonts["fm_copyright"].horizontalAdvance(state.copyright_text)
-            painter.drawText(width // 2 - copy_w // 2, height - 20, state.copyright_text)
-
-
+        _draw_with_painter(painter, state, width, height, fonts)
     finally:
         painter.end()
 
@@ -1212,15 +1254,55 @@ def _clear_glyph_cache():
 def clear_renderer_cache():
     """释放渲染器模块级缓存，减少内存占用。
 
-    渲染导出完成后或页面切换时调用，释放字形缓存、CUDA 上下文等。
+    渲染导出完成后或页面切换时调用，释放字形缓存、时间戳纹理、
+    CUDA 上下文、GLES 上下文等。
     """
     _clear_glyph_cache()
+    _clear_timestamp_cache()
     _clear_cuda_contexts()
-    # 关闭保存线程池（如果还活着）
-    _shutdown_save_pool()
+    _clear_gles_context()
     # 清理渲染错误缓存
     clear_last_render_error()
     logger.debug("渲染器模块级缓存已释放")
+
+
+def _rgba_to_nv12_gpu(
+    rgba: Any, width: int, height: int,
+) -> Any:
+    """在 GPU 上将 RGBA (CuPy, H×W×4, BGRA in memory) 转为 NV12 字节流。
+
+    NV12 布局: [Y: W×H bytes] + [UV: (H/2)×W bytes] (U/V 交错)
+    转换公式 (BT.601):
+        Y  = 0.299*R + 0.587*G + 0.114*B
+        U  = -0.169*R - 0.331*G + 0.500*B + 128
+        V  = 0.500*R - 0.419*G - 0.081*B + 128
+    色度使用 [::2,::2] 降采样（最快路径，合成视频可接受）。
+    """
+    import cupy as cp
+    # Qt ARGB32 in memory = BGRA: B=0, G=1, R=2, A=3
+    b = rgba[:, :, 0].astype(cp.float32)
+    g = rgba[:, :, 1].astype(cp.float32)
+    r = rgba[:, :, 2].astype(cp.float32)
+
+    # Y 平面
+    y = (0.299 * r + 0.587 * g + 0.114 * b).astype(cp.uint8)
+
+    # UV 平面（2:1 降采样，用 [::2,::2] 取每 2×2 块左上角像素）
+    r_sub = r[::2, ::2]
+    g_sub = g[::2, ::2]
+    b_sub = b[::2, ::2]
+
+    u = cp.clip(-0.169 * r_sub - 0.331 * g_sub + 0.500 * b_sub + 128, 0, 255).astype(cp.uint8)
+    v = cp.clip(0.500 * r_sub - 0.419 * g_sub - 0.081 * b_sub + 128, 0, 255).astype(cp.uint8)
+
+    # UV 交错: (H/2) × W, 偶数列为 U, 奇数列为 V
+    uv = cp.empty((height // 2, width), dtype=cp.uint8)
+    uv[:, 0::2] = u
+    uv[:, 1::2] = v
+
+    # 拼接 Y + UV → 一维字节数组
+    nv12 = cp.concatenate([y.ravel(), uv.ravel()])
+    return nv12
 
 
 def _get_glyph_texture(
@@ -1386,7 +1468,7 @@ def _render_frame_cuda(
 
     GPU 负责：背景填充、纹理 blit（alpha 混合）、折线绘制。
     多线程各自在独立 stream 上执行，可真正并行。
-    每帧 CPU 仅做 GPU→CPU 下载 + BMP 保存。
+    每帧 CPU 仅做 GPU→CPU 下载 + 交给保存线程写盘。
     """
     try:
         import cupy as cp
@@ -1507,18 +1589,162 @@ def _render_frame_cuda(
 
         # stream 同步（等待 GPU 完成）→ 下载到 CPU
         stream.synchronize()
+
+        # ====== GPU 端 RGBA→NV12 转换（消除 FFmpeg CPU 颜色转换瓶颈） ======
+        # 使用 CuPy 在 GPU 上直接转换，然后只下载 NV12 数据（3.1MB vs 8MB）
+        nv12_gpu = _rgba_to_nv12_gpu(fb, width, height)
+        nv12_cpu = cp.asnumpy(nv12_gpu)
+
         result_np = cp.asnumpy(fb)
         result_img = QImage(
             result_np.data, width, height, width * 4,
             QImage.Format.Format_ARGB32_Premultiplied,
         )
-        # 保持 numpy 引用存活（QImage 包装不拷贝数据，保存 BMP 时需要底层缓冲有效）
+        # 保持 numpy 引用存活（QImage 包装不拷贝数据，保存 PNG 时需要底层缓冲有效）
         result_img._numpy_ref = result_np
+        # 存储 NV12 字节供编码线程直接使用（跳过 FFmpeg 颜色转换）
+        result_img._nv12_bytes = nv12_cpu.tobytes()
         return result_img
 
     except Exception:
         logger.exception("CUDA 渲染失败，回退 CPU")
         return _render_frame_cpu(state, width, height, fonts)
+
+
+def _render_frame_nv12(
+    state: FrameState, width: int, height: int, fonts: dict,
+) -> Optional[bytes]:
+    """CUDA 渲染帧，直接返回 NV12 字节（跳过 QImage 创建，节省 8MB RGBA 下载）。
+
+    与 _render_frame_cuda 的区别：
+        - 不创建 QImage（省去 8MB RGBA 的 GPU→CPU 下载 + 内存分配）
+        - 只返回 NV12 字节（3.1MB）
+        - 适合纯编码流水线使用
+
+    Returns:
+        NV12 字节流，失败时返回 None
+    """
+    try:
+        import cupy as cp
+    except ImportError:
+        return None
+
+    try:
+        ctx = _get_cuda_ctx(width, height)
+        fb = ctx.fb
+        stream = ctx.stream
+
+        with stream:
+            # ---- 重置帧缓冲 ----
+            bg = QColor(state.bg_color)
+            fb[:, :, 0] = bg.blue()
+            fb[:, :, 1] = bg.green()
+            fb[:, :, 2] = bg.red()
+
+            cx, cy = width // 2, height // 2
+
+            # ---- 音名 ----
+            if state.show_note_name and state.note_name:
+                note_c = QColor(*state.note_color)
+                note_c.setAlpha(NOTE_ALPHA)
+                tex, tw, th = _get_glyph_texture(
+                    state.note_name, fonts["note_font"], note_c, fonts["fm_note"],
+                )
+                if tex is not None:
+                    _blit_texture(fb, tex, tw, th, cx - tw // 2, cy - th // 2, width, height)
+
+            # ---- 音高线 ----
+            if state.show_curve and state.pitch_points and len(state.pitch_points) >= 2:
+                _cuda_draw_polyline(
+                    fb, state.pitch_points,
+                    QColor(state.pitch_curve_color),
+                    NOTE_LINE_WIDTH, width, height,
+                )
+
+            # ---- 歌词 ----
+            if state.show_lyric and state.lyric:
+                lyric_c = QColor(*state.lyric_color)
+                tex, tw, th = _get_glyph_texture(
+                    state.lyric, fonts["ust_lyric_font"], lyric_c, fonts["fm_ust_lyric"],
+                )
+                if tex is not None:
+                    _blit_texture(fb, tex, tw, th, cx - tw // 2, cy - th // 2, width, height)
+
+            # ---- 左上角信息 ----
+            small_c = QColor(state.small_font_color)
+            y_off = 20
+            if state.show_song_name and state.song_name:
+                tex, tw, th = _get_glyph_texture(
+                    state.song_name, fonts["bold_small_font"], small_c, fonts["fm_small"],
+                )
+                if tex is not None:
+                    _blit_texture(fb, tex, tw, th, 20, y_off, width, height)
+                    y_off += 27
+            if state.show_song_author and state.song_author:
+                tex, tw, th = _get_glyph_texture(
+                    state.song_author, fonts["small_font"], small_c, fonts["fm_small"],
+                )
+                if tex is not None:
+                    _blit_texture(fb, tex, tw, th, 20, y_off, width, height)
+                    y_off += 25
+            if state.show_ust_author and state.ust_author:
+                tex, tw, th = _get_glyph_texture(
+                    state.ust_author, fonts["small_font"], small_c, fonts["fm_small"],
+                )
+                if tex is not None:
+                    _blit_texture(fb, tex, tw, th, 20, y_off, width, height)
+
+            # ---- BPM ----
+            if state.show_bpm:
+                bpm_text = f"BPM={state.tempo}"
+                tex, tw, th = _get_glyph_texture(
+                    bpm_text, fonts["small_font"], small_c, fonts["fm_small"],
+                )
+                if tex is not None:
+                    _blit_texture(fb, tex, tw, th, width - 20 - tw, 20, width, height)
+
+            # ---- LRC 歌词 ----
+            if state.show_lyric and state.lrc_lines and not state.lrc_hidden:
+                anchor_y = int(height * 0.3) if state.lyric_pos == "上" else int(height * 0.7)
+                line_h = fonts["fm_lyric"].height()
+                step = line_h * 1.3
+                n = len(state.lrc_lines)
+                if state.lyric_pos == "上":
+                    top_baseline = anchor_y - (n - 1) * step
+                else:
+                    top_baseline = anchor_y
+                lrc_c = QColor(state.small_font_color)
+                for li, text in enumerate(state.lrc_lines):
+                    baseline = int(top_baseline + li * step)
+                    tex, tw, th = _get_glyph_texture(
+                        text, fonts["lyric_font"], lrc_c, fonts["fm_lyric"],
+                    )
+                    if tex is not None:
+                        x0 = width // 2 - tw // 2
+                        y0 = baseline - fonts["fm_lyric"].ascent()
+                        _blit_texture(fb, tex, tw, th, x0, y0, width, height)
+
+            # ---- 版权 ----
+            if state.show_copyright:
+                copy_c = QColor(195, 195, 195)
+                copy_c.setAlpha(COPYRIGHT_ALPHA)
+                tex, tw, th = _get_glyph_texture(
+                    state.copyright_text, fonts["copyright_font"], copy_c, fonts["fm_copyright"],
+                )
+                if tex is not None:
+                    x0 = width // 2 - tw // 2
+                    y0 = height - 20 - th
+                    _blit_texture(fb, tex, tw, th, x0, y0, width, height)
+
+        # stream 同步（等待 GPU 完成）→ 只下载 NV12（3.1MB，跳过 8MB RGBA）
+        stream.synchronize()
+        nv12_gpu = _rgba_to_nv12_gpu(fb, width, height)
+        nv12_cpu = cp.asnumpy(nv12_gpu)
+        return nv12_cpu.tobytes()
+
+    except Exception:
+        logger.exception("CUDA→NV12 渲染失败")
+        return None
 
 
 def get_cuda_render_status() -> Tuple[bool, str]:
@@ -1597,6 +1823,217 @@ def _build_glyph_cache(
     return len(_GLYPH_CACHE)
 
 
+# ===================== OpenGL ES 渲染后端 =====================
+
+
+class _OpenGLESRenderer:
+    """基于 OpenGL 的离屏渲染器（FBO + QOpenGLPaintDevice + 同步回读）。
+
+    核心流程：
+      ① 绑定 FBO → glClear 清空背景
+      ② QOpenGLPaintDevice 桥接 QPainter 到 GPU 绘制（复用 _draw_with_painter）
+      ③ glReadPixels 同步回读 RGBA 像素
+      ④ 创建 QImage（Format_RGBA8888），管线编码线程自行处理 NV12 转换
+
+    为什么不直接 QPainter(FBO)：
+      - PySide6 中 QOpenGLFramebufferObject 不被识别为 QPaintDevice
+      - 改用 QOpenGLPaintDevice + FBO 绑定，效果相同
+
+    为什么不使用 PBO 双缓冲：
+      - 逐帧渲染管线中，每帧只渲染一次，PBO 的异步回读优势不明显
+      - 同步 glReadPixels 更简单、正确性更高
+      - NV12 转换由管线编码线程异步处理，不阻塞渲染
+
+    线程安全：单线程渲染，内部用锁保护。
+    """
+
+    def __init__(self):
+        self._context = None  # QOpenGLContext
+        self._surface = None  # QOffscreenSurface
+        self._fbo = None  # QOpenGLFramebufferObject
+        self._gl = None  # QOpenGLFunctions
+        self._paint_device = None  # QOpenGLPaintDevice
+        self._lock = threading.Lock()
+        self._initialized = False
+        self._width = 0
+        self._height = 0
+        # 预分配像素缓冲区（跨帧复用）
+        self._pixel_buf = None
+
+    def ensure_init(self, width: int, height: int) -> None:
+        """确保 GLES 渲染器已初始化，分辨率变化时重建。"""
+        if self._initialized and self._width == width and self._height == height:
+            return
+        self._cleanup()
+        self._init_gles(width, height)
+
+    def _init_gles(self, width: int, height: int) -> None:
+        """初始化 OpenGL 上下文 + FBO + QOpenGLPaintDevice + 像素缓冲区。"""
+        from PySide6.QtGui import QSurfaceFormat, QOffscreenSurface, QOpenGLContext
+        from PySide6.QtOpenGL import (
+            QOpenGLPaintDevice, QOpenGLFramebufferObject, QOpenGLFramebufferObjectFormat,
+        )
+
+        self._width = width
+        self._height = height
+
+        # 1. 创建 OpenGL 上下文（桌面 OpenGL 3.3，最高兼容性）
+        fmt = QSurfaceFormat()
+        fmt.setRenderableType(QSurfaceFormat.OpenGL)
+        fmt.setVersion(3, 3)
+        fmt.setSwapInterval(0)
+        fmt.setSamples(0)
+
+        self._context = QOpenGLContext()
+        self._context.setFormat(fmt)
+        if not self._context.create():
+            raise RuntimeError("无法创建 OpenGL 上下文")
+
+        # 2. 创建离屏 surface
+        self._surface = QOffscreenSurface()
+        self._surface.setFormat(fmt)
+        self._surface.create()
+
+        if not self._context.makeCurrent(self._surface):
+            raise RuntimeError("无法激活 OpenGL 上下文")
+
+        # 获取 OpenGL 函数接口
+        self._gl = self._context.functions()
+
+        # 3. 创建 FBO（离屏渲染目标）
+        fbo_fmt = QOpenGLFramebufferObjectFormat()
+        fbo_fmt.setInternalTextureFormat(0x8058)  # GL_RGBA8
+        fbo_fmt.setAttachment(QOpenGLFramebufferObject.NoAttachment)
+
+        self._fbo = QOpenGLFramebufferObject(width, height, fbo_fmt)
+        if not self._fbo.isValid():
+            raise RuntimeError("FBO 创建失败")
+
+        # 4. 创建 QOpenGLPaintDevice（桥接 QPainter → GPU）
+        self._paint_device = QOpenGLPaintDevice(width, height)
+
+        # 5. 预分配像素缓冲区
+        self._pixel_buf = bytearray(width * height * 4)
+
+        self._initialized = True
+        logger.info(f"GLES 渲染器初始化完成: {width}x{height}")
+
+    def render_frame(
+        self, state: FrameState, width: int, height: int, fonts: dict,
+    ) -> QImage:
+        """渲染一帧：FBO 离屏渲染 → 同步 glReadPixels 回读 → 返回 QImage。
+
+        NV12 转换由管线编码线程异步处理（不阻塞渲染），
+        渲染线程只负责 GPU 绘制和像素回读。
+
+        Returns:
+            QImage (Format_RGBA8888)，管线编码线程自行转换 NV12
+        """
+        with self._lock:
+            self.ensure_init(width, height)
+            self._context.makeCurrent(self._surface)
+
+            _t0 = time.monotonic()
+
+            # ========== 1. 绑定 FBO 并清除背景 ==========
+            self._fbo.bind()
+
+            bg = QColor(state.bg_color)
+            self._gl.glClearColor(bg.redF(), bg.greenF(), bg.blueF(), 1.0)
+            self._gl.glClear(0x00004000)  # GL_COLOR_BUFFER_BIT
+
+            # 通知 QOpenGLPaintDevice 尺寸变化
+            if self._paint_device.size() != QSize(self._width, self._height):
+                self._paint_device.setSize(QSize(self._width, self._height))
+
+            # ========== 2. QPainter → QOpenGLPaintDevice → GPU 绘制 ==========
+            painter = QPainter(self._paint_device)
+            try:
+                _draw_with_painter(painter, state, self._width, self._height, fonts)
+            finally:
+                painter.end()
+
+            # ========== 3. 同步 glReadPixels 回读 ==========
+            buf_size = self._width * self._height * 4
+            if self._pixel_buf is None or len(self._pixel_buf) < buf_size:
+                self._pixel_buf = bytearray(buf_size)
+            self._gl.glReadPixels(
+                0, 0, self._width, self._height,
+                0x1908,  # GL_RGBA
+                0x1401,  # GL_UNSIGNED_BYTE
+                self._pixel_buf,
+            )
+
+            self._fbo.release()
+
+            # ========== 4. 创建 QImage（拷贝像素数据，避免与编码线程的数据竞争） ==========
+            import numpy as np
+            # 拷贝像素数据：QImage 拥有自己的缓冲区，编码线程可安全读取
+            pixel_copy = bytearray(self._pixel_buf)
+            rgba_np = np.frombuffer(pixel_copy, dtype=np.uint8).reshape(
+                height, width, 4)
+            # OpenGL 坐标系 Y=0 在底部，需要翻转行序
+            rgba_np[:] = rgba_np[::-1, :, :]
+
+            img = QImage(rgba_np.data, width, height, QImage.Format.Format_RGBA8888)
+            img._pixel_ref = pixel_copy
+
+            _elapsed = time.monotonic() - _t0
+            if _elapsed > 0.015:
+                logger.debug(f"GLES 渲染帧耗时: {_elapsed*1000:.1f}ms")
+            return img
+
+    def _cleanup(self) -> None:
+        """释放 OpenGL 资源（FBO、paint device、上下文、surface）。"""
+        if self._initialized:
+            try:
+                self._paint_device = None
+                self._fbo = None
+                if self._context:
+                    self._context.doneCurrent()
+                self._context = None
+                if self._surface:
+                    self._surface.destroy()
+                self._surface = None
+            except Exception:
+                logger.exception("GLES 资源清理异常")
+            self._initialized = False
+            self._gl = None
+            self._pixel_buf = None
+            logger.debug("GLES 渲染器资源已释放")
+
+    def __del__(self):
+        self._cleanup()
+
+
+# 全局 GLES 渲染器实例（单例，线程安全）
+_GLES_RENDERER = _OpenGLESRenderer()
+
+
+def _render_frame_opengl(
+    state: FrameState, width: int, height: int, fonts: dict,
+) -> QImage:
+    """OpenGL ES 后端渲染：FBO 离屏渲染 + QPainter 桥接 GPU。
+
+    GPU 负责所有绘制（通过 QPainter → QOpenGLPaintDevice → GLES 管线）。
+    使用 FBO 离屏渲染 + toImage() 回读像素。
+    单线程渲染（GLES 非线程安全），内部锁保护。
+
+    Returns:
+        QImage (Format_ARGB32_Premultiplied)，失败时回退 CPU 渲染
+    """
+    try:
+        return _GLES_RENDERER.render_frame(state, width, height, fonts)
+    except Exception:
+        logger.exception("GLES 渲染失败，回退 CPU")
+        return _render_frame_cpu(state, width, height, fonts)
+
+
+def _clear_gles_context() -> None:
+    """释放 GLES 渲染器上下文资源（渲染完成后调用）。"""
+    _GLES_RENDERER._cleanup()
+
+
 # ===================== 渲染器选择 =====================
 
 
@@ -1606,6 +2043,7 @@ def _select_render_backend(
     """选择渲染后端。
 
     CUDA 后端使用 CuPy 在 GPU 上渲染（背景填充 + 字形纹理混合 + 折线绘制），
+    GLES 后端使用 QOpenGLFramebufferObject 离屏渲染 + QPainter 桥接 GPU，
     CPU 后端使用 QPainter 多线程渲染。
     GPU 加速还体现在编码阶段：NVIDIA 用 NVENC，AMD 用 AMF，Intel 用 QSV。
     用户选 CPU 后端时编码器也降级为 libx264（纯软件编码）。
@@ -1627,154 +2065,440 @@ def _select_render_backend(
         return "cpu", _render_frame_cpu
 
     if preferred == "opengl":
-        # OpenGL 选项保留为 CUDA 回退（UI 兼容）
-        if hw.supports_cuda_render and _check_cuda_available():
-            return "cuda", _render_frame_cuda
-        return "cpu", _render_frame_cpu
+        # OpenGL ES 后端：FBO 离屏渲染 + QPainter 桥接 GPU
+        # 兼容所有显卡，不需要 CUDA
+        return "opengl", _render_frame_opengl
 
-    # auto: 有 NVIDIA 显卡就用 CUDA（GPU 渲染 + NVENC 编码），否则 CPU
+    # auto: 有 NVIDIA 显卡就用 CUDA，否则 GLES
     if hw.supports_cuda_render and _check_cuda_available():
         return "cuda", _render_frame_cuda
-    return "cpu", _render_frame_cpu
+    return "opengl", _render_frame_opengl
 
 
-# ===================== 多线程渲染 =====================
+# ===================== 渲染编码并行流水线 =====================
 
 
-# 保存线程池（渲染/保存流水线分离）
-# 渲染线程只做 GPU 渲染并提交保存任务，不阻塞等待保存完成，
-# 这样 GPU 可以持续工作，不会因磁盘 IO 空转。
-_SAVE_POOL = None
-_SAVE_FUTURES: List[Any] = []
-_SAVE_LOCK = threading.Lock()
+# 时间戳纹理缓存（避免每帧重复 QPainter 渲染）
+_TIMESTAMP_CACHE: Dict[str, Tuple[Any, int, int]] = {}
+_TS_CACHE_LOCK = threading.Lock()
 
 
-def _init_save_pool(max_workers: int = 4):
-    """初始化全局保存线程池。"""
-    global _SAVE_POOL
-    if _SAVE_POOL is None:
-        _SAVE_POOL = ThreadPoolExecutor(max_workers=max_workers)
+def _clear_timestamp_cache():
+    """清空时间戳纹理缓存（渲染结束后释放内存）。"""
+    with _TS_CACHE_LOCK:
+        _TIMESTAMP_CACHE.clear()
 
 
-def _wait_saves() -> None:
-    """等待所有已提交的保存任务完成（渲染阶段结束后调用）。"""
-    global _SAVE_FUTURES
-    with _SAVE_LOCK:
-        futures = _SAVE_FUTURES
-        _SAVE_FUTURES = []
-    for f in futures:
-        try:
-            f.result()
-        except Exception:
-            logger.exception("保存线程异常")
+def _get_timestamp_overlay(
+    time_str: str, font: QFont, color: QColor,
+) -> Tuple[Any, int, int]:
+    """获取时间戳文字的 RGBA numpy 数组（缓存）。
 
-
-def _shutdown_save_pool() -> None:
-    """关闭保存线程池（渲染全部结束后调用）。"""
-    global _SAVE_POOL
-    try:
-        _wait_saves()
-        if _SAVE_POOL is not None:
-            _SAVE_POOL.shutdown(wait=True)
-    finally:
-        _SAVE_POOL = None
-
-
-def _save_img(img: Any, path: str, width: int, height: int) -> None:
-    """保存一帧图像（在保存线程池中执行）。
-
-    CUDA 后端返回的 QImage 包装了 numpy 数据（_numpy_ref），
-    直接用 numpy 写 BMP（跳过 Qt 层，更快）。
-    CPU 后端返回普通 QImage，用 QImage.save。
-    """
-    numpy_ref = getattr(img, "_numpy_ref", None)
-    if numpy_ref is not None:
-        _save_bmp_numpy(numpy_ref, path, width, height)
-    else:
-        img.save(path, "BMP")
-
-
-def _save_bmp_numpy(bgra_arr: Any, path: str, width: int, height: int) -> None:
-    """用 numpy 直接写 BMP 文件（BGRA → BGR，bottom-up）。
-
-    比 QImage.save("BMP") 少一层 Qt 封装，写入更快。
-    """
-    import numpy as np
-
-    # BMP 是 bottom-up BGR，去掉 alpha 通道并翻转
-    bgr = np.ascontiguousarray(bgra_arr[::-1, :, :3])
-    row_size = width * 3
-    padding = (4 - row_size % 4) % 4
-    stride = row_size + padding
-
-    if padding:
-        out = np.zeros((height, stride), dtype=np.uint8)
-        out[:, :row_size] = bgr.reshape(height, row_size)
-    else:
-        out = bgr.reshape(height, stride)
-
-    import struct
-    file_size = 54 + stride * height
-    header = (
-        struct.pack('<2sIHHI', b'BM', file_size, 0, 0, 54)
-        + struct.pack('<IiiHHIIiiII', 40, width, height, 1, 24, 0,
-                       stride * height, 2835, 2835, 0, 0)
-    )
-    with open(path, 'wb') as f:
-        f.write(header)
-        f.write(out.tobytes())
-
-
-def _render_chunk(
-    chunk: List[Tuple[int, FrameState]],
-    render_func: Callable,
-    width: int, height: int, fonts: dict,
-    temp_dir: str,
-    progress_callback: Optional[Callable] = None,
-    progress_offset: int = 0,
-    total: int = 0,
-) -> List[str]:
-    """渲染一批帧（渲染完成后异步保存，流水线并行）。
-
-    Args:
-        chunk: [(frame_idx, state), ...]
-        render_func: 渲染函数
-        width, height, fonts: 渲染参数
-        temp_dir: 临时目录
-        progress_callback: 进度回调
-        progress_offset: 进度偏移
-        total: 总帧数
+    用 QPainter 渲染小段文字到纹理，后续直接 numpy blit 到帧缓冲，
+    避免 FFmpeg drawtext 滤镜的逐帧 CPU 开销。
 
     Returns:
-        [frame_path, ...]
+        (numpy_array_h_w_4, width, height)
     """
-    paths = []
-    for local_idx, (frame_idx, state) in enumerate(chunk):
-        try:
-            img = render_func(state, width, height, fonts)
-            path = os.path.join(temp_dir, f"frame_{frame_idx:06d}.bmp")
-            # 异步保存：渲染线程不阻塞，保存在线程池并行
-            with _SAVE_LOCK:
-                _SAVE_FUTURES.append(
-                    _SAVE_POOL.submit(_save_img, img, path, width, height)
+    key = f"{time_str}|{font.family()}|{font.pointSize()}|{font.weight()}|{color.rgba()}"
+    with _TS_CACHE_LOCK:
+        if key in _TIMESTAMP_CACHE:
+            return _TIMESTAMP_CACHE[key]
+
+    import numpy as np
+    fm = QFontMetrics(font)
+    tw = max(1, fm.horizontalAdvance(time_str))
+    th = max(1, fm.height())
+
+    img = QImage(tw, th, QImage.Format.Format_ARGB32_Premultiplied)
+    img.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(img)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setFont(font)
+    painter.setPen(color)
+    painter.drawText(0, fm.ascent(), time_str)
+    painter.end()
+
+    ptr = img.bits()
+    arr = np.frombuffer(ptr, dtype=np.uint8).reshape((th, tw, 4)).copy()
+
+    with _TS_CACHE_LOCK:
+        _TIMESTAMP_CACHE[key] = (arr, tw, th)
+    return arr, tw, th
+
+
+# ===================== 逐帧渲染编码 =====================
+
+
+def _rgba_to_nv12_cpu(img: QImage, width: int, height: int) -> Optional[bytes]:
+    """CPU 端 RGBA→NV12 转换（整数运算，供管线编码线程使用）。
+
+    支持两种 QImage 格式：
+      - Format_ARGB32_Premultiplied（CPU 后端）：内存序 BGRA，B=0 G=1 R=2
+      - Format_RGBA8888（GLES 后端）：内存序 RGBA，R=0 G=1 B=2
+
+    使用 BT.601 整数运算（uint16，避免 float32 开销）：
+        Y  = (77*R + 150*G + 29*B) >> 8
+        U  = ((-43*R - 85*G + 128*B) >> 8) + 128
+        V  = ((128*R - 107*G - 21*B) >> 8) + 128
+
+    Returns:
+        NV12 字节流（[Y: W×H] + [UV: (H/2)×W]，U/V 交错），失败返回 None
+    """
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+    try:
+        ptr = img.bits()
+        rgba_np = np.frombuffer(ptr, dtype=np.uint8).reshape((height, width, 4))
+
+        # 检测格式：RGBA8888 内存序为 RGBA，ARGB32 内存序为 BGRA
+        # 使用 uint16（2 字节）比 int32 省一半内存带宽，实测更快
+        is_rgba = (img.format() == QImage.Format.Format_RGBA8888)
+        if is_rgba:
+            r = rgba_np[:, :, 0].astype(np.uint16)
+            g = rgba_np[:, :, 1].astype(np.uint16)
+            b = rgba_np[:, :, 2].astype(np.uint16)
+        else:
+            b = rgba_np[:, :, 0].astype(np.uint16)
+            g = rgba_np[:, :, 1].astype(np.uint16)
+            r = rgba_np[:, :, 2].astype(np.uint16)
+
+        # BT.601: Y = (77*R + 150*G + 29*B) >> 8
+        # 77*255 + 150*255 + 29*255 = 65280，uint16 足够
+        y = ((77 * r + 150 * g + 29 * b) >> 8).astype(np.uint8)
+
+        # UV 子采样 + 交错
+        r_sub = r[::2, ::2]
+        g_sub = g[::2, ::2]
+        b_sub = b[::2, ::2]
+
+        u = np.clip(((128 * b_sub - 43 * r_sub - 85 * g_sub) >> 8) + 128, 0, 255).astype(np.uint8)
+        v = np.clip(((128 * r_sub - 107 * g_sub - 21 * b_sub) >> 8) + 128, 0, 255).astype(np.uint8)
+
+        uv = np.empty((height // 2, width), dtype=np.uint8)
+        uv[:, 0::2] = u
+        uv[:, 1::2] = v
+
+        return y.tobytes() + uv.tobytes()
+    except Exception as e:
+        logger.exception(f"CPU RGBA→NV12 转换失败: {e}")
+        return None
+
+
+def _render_encode_pipeline(
+    frame_states: List[FrameState],
+    render_func: Callable,
+    width: int, height: int,
+    fonts: dict,
+    num_threads: int,
+    hw: HardwareInfo,
+    ust_info: dict,
+    output_path: str,
+    fps: int,
+    total_output: int,
+    progress_callback: Optional[Callable] = None,
+    use_nv12: bool = False,
+) -> bool:
+    """多线程渲染 + 逐帧真实编码（不做去重，不做比特流重复）。
+
+    用户要求「存多少帧就渲染多少帧」——不做视觉去重，每个时间区间
+    独立渲染；编码端逐帧真实编码（正常 GOP），不解析/不重复 H.264
+    比特流，保证转音（portamento）曲线完整保留。
+
+    流程：
+        ① 启动 FFmpeg：rawvideo(nv12) stdin → h264（正常 GOP）→ 临时 .h264
+        ② 多线程渲染每个时间区间帧 → 有序缓冲 → 编码线程按 frame_count 逐帧写入 pipe
+        ③ 音频 mux → 输出 .mp4
+
+    Args:
+        frame_states: 预计算的时间区间帧状态列表（每项 frame_count = 该状态持续帧数）
+        render_func: 渲染函数 (state, width, height, fonts) -> QImage
+        width, height: 渲染分辨率
+        fonts: 渲染用字体 dict
+        num_threads: 渲染并行线程数
+        hw: 硬件信息（含编码器名）
+        ust_info: 完整 ust_info（用于取 audio_path）
+        output_path: 输出 .mp4 路径
+        fps: 输出帧率
+        total_output: 总输出帧数（= sum(frame_count)），用于进度
+        progress_callback: 阶段进度回调
+        use_nv12: 渲染函数是否直接附带 _nv12_bytes（CUDA 后端）
+
+    Returns:
+        是否成功
+    """
+    ffmpeg = _find_ffmpeg()
+    if not ffmpeg:
+        msg = "未找到 ffmpeg，无法编码视频"
+        logger.error(msg)
+        set_last_render_error(msg)
+        return False
+
+    output_dir = os.path.dirname(output_path)
+    video_h264_path = os.path.join(
+        output_dir, "_video_tmp.h264")
+
+    try:
+        # ---- 构建 FFmpeg 命令：逐帧编码（正常 GOP） ----
+        cmd = [
+            ffmpeg, "-y",
+            "-f", "rawvideo",
+            "-pixel_format", "nv12",
+            "-video_size", f"{width}x{height}",
+            "-framerate", str(fps),
+            "-i", "-",
+            "-c:v", hw.encoder_name,
+        ]
+        if "nvenc" in hw.encoder_name:
+            cmd.extend(NVENC_FAST_OPTS)
+            # 补充 profile/coder 选项（测试验证过的最快参数组合）
+            cmd.extend(["-profile:v", "main", "-coder", "vlc", "-weighted_pred", "0"])
+        elif "amf" in hw.encoder_name:
+            cmd.extend(["-quality", "speed", "-rc", "vbr_peak", "-qp_i", "23", "-qp_p", "23", "-bf", "0"])
+        elif "qsv" in hw.encoder_name:
+            cmd.extend(["-preset", "veryfast", "-global_quality", "23", "-bf", "0"])
+        else:
+            cmd.extend(["-preset", "veryfast", "-crf", "23", "-bf", "0"])
+        # 正常 GOP（关键帧间隔 2 秒），逐帧编码所有输出帧
+        cmd.extend(["-g", str(fps * 2), "-pix_fmt", "yuv420p", "-f", "h264", video_h264_path])
+
+        logger.info(f"逐帧编码命令: {' '.join(cmd)}")
+
+        # 启动 FFmpeg 进程（stdin 管道输入）
+        process = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0,
+        )
+
+        # ---- stderr 读取线程（防死锁 + 错误捕获） ----
+        stderr_lines: List[str] = []
+        _MAX_STDERR_LINES = 300
+
+        def _read_stderr():
+            try:
+                assert process.stderr is not None
+                for line in process.stderr:
+                    if isinstance(line, bytes):
+                        line = line.decode('utf-8', errors='replace')
+                    stderr_lines.append(line)
+                    if len(stderr_lines) > _MAX_STDERR_LINES:
+                        del stderr_lines[:len(stderr_lines) - _MAX_STDERR_LINES]
+            except Exception:
+                pass
+
+        stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
+        stderr_thread.start()
+
+        # ---- 共享状态 ----
+        states_count = len(frame_states)
+        results: List[Optional[QImage]] = [None] * states_count
+        results_lock = threading.Lock()
+        cv = threading.Condition(results_lock)
+        encode_error: List[Optional[Exception]] = [None]
+        frames_written: List[int] = [0]
+
+        # ---- 编码线程（消费者）：按序取渲染结果，逐帧真实编码 ----
+        def _encoder_worker():
+            """按 frame_count 将每帧写入 pipe（逐帧真实编码，不做比特流重复）。"""
+            try:
+                for frame_idx, state in enumerate(frame_states):
+                    with cv:
+                        while results[frame_idx] is None and encode_error[0] is None:
+                            cv.wait(timeout=1.0)
+                        if encode_error[0] is not None:
+                            return
+                        img = results[frame_idx]
+
+                    # 获取 NV12 字节（CUDA 后端 GPU 转换；CPU 后端此处 CPU 转换）
+                    nv12_bytes = getattr(img, "_nv12_bytes", None)
+                    if nv12_bytes is None:
+                        nv12_bytes = _rgba_to_nv12_cpu(img, width, height)
+                    if nv12_bytes is None:
+                        raise RuntimeError(f"帧 {frame_idx} 无法转换为 NV12")
+
+                    # 同一状态帧按 frame_count 逐帧编码
+                    assert process.stdin is not None
+                    for _ in range(state.frame_count):
+                        process.stdin.write(nv12_bytes)
+                        frames_written[0] += 1
+
+                    # 进度更新
+                    if progress_callback:
+                        pct = min(frames_written[0] / total_output * 100, 99)
+                        progress_callback(pct, "GPU渲染")
+
+                    del img  # 释放 QImage 引用
+
+                assert process.stdin is not None
+                process.stdin.close()
+            except BrokenPipeError:
+                process.wait(timeout=5)
+                stderr_text = ''.join(stderr_lines)[-1500:]
+                err = BrokenPipeError(
+                    f"FFmpeg 进程意外退出 (退出码 {process.returncode})。\n"
+                    f"FFmpeg stderr:\n{stderr_text}"
                 )
-            paths.append(path)
-        except Exception:
-            logger.exception(f"渲染帧 {frame_idx} 失败")
-            # 创建一个空白帧代替
-            fallback = QImage(width, height, QImage.Format.Format_ARGB32_Premultiplied)
-            fallback.fill(QColor(state.bg_color))
-            path = os.path.join(temp_dir, f"frame_{frame_idx:06d}.bmp")
-            with _SAVE_LOCK:
-                _SAVE_FUTURES.append(
-                    _SAVE_POOL.submit(_save_img, fallback, path, width, height)
-                )
-            paths.append(path)
+                encode_error[0] = err
+                logger.error(f"编码线程: FFmpeg 崩溃\n{stderr_text}")
+            except Exception as e:
+                encode_error[0] = e
+                logger.exception("编码线程异常")
+                try:
+                    process.stdin.close()
+                except Exception:
+                    pass
+
+        encoder_thread = threading.Thread(target=_encoder_worker, daemon=True)
+        encoder_thread.start()
+
+        # ---- 渲染线程（生产者）：多线程并行渲染每个时间区间帧 ----
+        # GLES 后端：QOpenGLContext 必须在创建它的线程中使用，因此 inline 渲染
+        # CUDA 后端：多线程并行渲染
+        if num_threads == 1:
+            # 单线程 inline 渲染（用于 GLES 后端，避免跨线程 QOpenGLContext 问题）
+            logger.debug("单线程 inline 渲染（GLES 后端）")
+            for frame_idx, state in enumerate(frame_states):
+                try:
+                    img = render_func(state, width, height, fonts)
+                except Exception:
+                    logger.exception(f"渲染帧 {frame_idx} 失败")
+                    img = QImage(width, height, QImage.Format.Format_ARGB32_Premultiplied)
+                    img.fill(QColor(state.bg_color))
+
+                with cv:
+                    results[frame_idx] = img
+                    cv.notify_all()
+        else:
+            def _render_worker(chunk: List[Tuple[int, FrameState]]):
+                for frame_idx, state in chunk:
+                    try:
+                        img = render_func(state, width, height, fonts)
+                    except Exception:
+                        logger.exception(f"渲染帧 {frame_idx} 失败")
+                        img = QImage(width, height, QImage.Format.Format_ARGB32_Premultiplied)
+                        img.fill(QColor(state.bg_color))
+
+                    with cv:
+                        results[frame_idx] = img
+                        cv.notify_all()
+
+            chunks: List[List[Tuple[int, FrameState]]] = []
+            for i, state in enumerate(frame_states):
+                chunk_idx = i % num_threads
+                while len(chunks) <= chunk_idx:
+                    chunks.append([])
+                chunks[chunk_idx].append((i, state))
+
+            with ThreadPoolExecutor(max_workers=num_threads) as executor:
+                futures = [executor.submit(_render_worker, chunk) for chunk in chunks]
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        logger.exception("渲染线程异常")
+                        if encode_error[0] is None:
+                            encode_error[0] = e
+
+        # 等待编码线程与 FFmpeg 结束
+        encoder_thread.join(timeout=300)
+        process.wait(timeout=300)
+        stderr_thread.join(timeout=2)
+
+        if encode_error[0] is not None:
+            stderr_text = ''.join(stderr_lines)[-1500:]
+            msg = f"编码异常：{type(encode_error[0]).__name__}: {encode_error[0]}"
+            if stderr_text:
+                msg += f"\nFFmpeg stderr:\n{stderr_text}"
+            logger.error(msg)
+            set_last_render_error(msg)
+            return False
+
+        if process.returncode != 0:
+            stderr_text = ''.join(stderr_lines)[-1500:]
+            msg = f"FFmpeg 编码失败 (退出码 {process.returncode}):\n{stderr_text}"
+            logger.error(msg)
+            set_last_render_error(msg)
+            return False
 
         if progress_callback:
-            progress_callback(progress_offset + local_idx + 1, total, "GPU 渲染中")
+            progress_callback(95, "编码")
 
-    return paths
+        # ==================== 音频合并 / 封装 MP4 ====================
+        audio_path = ust_info.get("player_style", {}).get("audio_path", "")
+        if audio_path and os.path.exists(audio_path):
+            # 注意：裸 h264 输入没有 PTS，直接 -c copy 到 MP4 会导致
+            # mov muxer 无法 interleave（time=N/A、audio:0KiB、无音频流）。
+            # 先封装成 MPEG-TS（生成正确 PTS），再与音频转封装为 MP4。
+            ts_tmp = os.path.join(output_dir, "_video_mux_tmp.ts")
+            step1_cmd = [
+                ffmpeg, "-y",
+                "-f", "h264",
+                "-r", str(fps),
+                "-i", video_h264_path,
+                "-c", "copy",
+                "-f", "mpegts",
+                ts_tmp,
+            ]
+            logger.info(f"FFmpeg H.264→TS 命令: {' '.join(step1_cmd)}")
+            r1 = subprocess.run(
+                step1_cmd, capture_output=True, text=True, encoding='utf-8', errors='replace',
+                timeout=3600,
+                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0,
+            )
+            if r1.returncode != 0:
+                tail = r1.stderr.strip()[-1500:] if r1.stderr else "(无 stderr 输出)"
+                msg = f"FFmpeg H.264→TS 失败 (退出码 {r1.returncode}):\n{tail}"
+                logger.error(msg)
+                set_last_render_error(msg)
+                shutil.move(video_h264_path, output_path)
+            else:
+                mux_cmd = [
+                    ffmpeg, "-y",
+                    "-i", ts_tmp,
+                    "-i", audio_path,
+                    "-map", "0:0",
+                    "-map", "1:0",
+                    "-c:v", "copy",
+                    "-c:a", "aac",
+                    "-b:a", "192k",
+                    "-shortest",
+                    output_path,
+                ]
+                logger.info(f"FFmpeg 音频合并命令: {' '.join(mux_cmd)}")
+                result = subprocess.run(
+                    mux_cmd, capture_output=True, text=True, encoding='utf-8', errors='replace',
+                    timeout=3600,
+                    creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0,
+                )
+                if result.returncode != 0:
+                    tail = result.stderr.strip()[-1500:] if result.stderr else "(无 stderr 输出)"
+                    msg = f"FFmpeg 音频合并失败 (退出码 {result.returncode}):\n{tail}"
+                    logger.error(msg)
+                    set_last_render_error(msg)
+                    shutil.move(video_h264_path, output_path)
+                else:
+                    try:
+                        os.unlink(video_h264_path)
+                    except Exception:
+                        pass
+                    try:
+                        os.unlink(ts_tmp)
+                    except Exception:
+                        pass
+        else:
+            shutil.move(video_h264_path, output_path)
+
+        if progress_callback:
+            progress_callback(100, "编码")
+
+        return True
+
+    except Exception as e:
+        logger.exception("编码管道失败")
+        set_last_render_error(f"编码管道异常：{type(e).__name__}: {e}")
+        return False
 
 
 # ===================== FFmpeg 编码 =====================
@@ -1784,12 +2508,21 @@ def _find_ffmpeg() -> Optional[str]:
     """查找可用的 ffmpeg 可执行文件。
 
     查找顺序:
-      1. PATH 环境变量
-      2. imageio-ffmpeg 内置
+      1. imageio-ffmpeg 内置（优先，功能完整，支持 concat demuxer + NVENC）
+      2. PATH 环境变量
       3. 程序根目录
       4. 当前目录
     """
-    # 1. PATH
+    # 1. imageio-ffmpeg（优先：功能完整，避免 PATH 中的精简版缺失 concat demuxer / NVENC）
+    try:
+        import imageio_ffmpeg
+        path = imageio_ffmpeg.get_ffmpeg_exe()
+        if path and os.path.exists(path):
+            return path
+    except Exception:
+        pass
+
+    # 2. PATH
     try:
         result = subprocess.run(
             ["ffmpeg", "-version"], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5,
@@ -1797,15 +2530,6 @@ def _find_ffmpeg() -> Optional[str]:
         )
         if result.returncode == 0:
             return "ffmpeg"
-    except Exception:
-        pass
-
-    # 2. imageio-ffmpeg
-    try:
-        import imageio_ffmpeg
-        path = imageio_ffmpeg.get_ffmpeg_exe()
-        if path and os.path.exists(path):
-            return path
     except Exception:
         pass
 
@@ -1824,392 +2548,6 @@ def _find_ffmpeg() -> Optional[str]:
     return None
 
 
-def _resolve_font_path(font_family: str) -> str:
-    """解析字体文件路径，用于 FFmpeg drawtext 滤镜。"""
-    # 尝试从系统字体目录查找
-    font_files = {
-        "微软雅黑": "msyh.ttc",
-        "Microsoft YaHei": "msyh.ttc",
-        "等线": "Deng.ttf",
-        "DengXian": "Deng.ttf",
-        "黑体": "simhei.ttf",
-        "SimHei": "simhei.ttf",
-        "宋体": "simsun.ttc",
-        "SimSun": "simsun.ttc",
-    }
-
-    if font_family in font_files:
-        # 尝试在 Windows 字体目录查找
-        windir = os.environ.get("WINDIR", "C:\\Windows")
-        font_path = os.path.join(windir, "Fonts", font_files[font_family])
-        if os.path.exists(font_path):
-            return font_path
-
-    # 回退：假设字体名就是文件名（Linux 风格）
-    return font_family
-
-
-def _escape_ffmpeg_path(path: str) -> str:
-    """转义 FFmpeg 路径中的特殊字符。
-
-    FFmpeg 滤镜语法中，\\: 表示转义冒号（避免被解析为选项分隔符），
-    \\\\ 表示字面反斜杠。Windows 路径 C:/Windows/Fonts/msyh.ttc
-    应转为 C\\:/Windows/Fonts/msyh.ttc（\\: = 字面冒号）。
-    """
-    # 先统一为正斜杠，再转义冒号
-    path = path.replace('\\', '/')
-    return path.replace(':', '\\:')
-
-
-def _build_concat_file(
-    frame_states: List[FrameState],
-    temp_dir: str,
-    fps: int,
-) -> str:
-    """生成 FFmpeg concat 描述文件。
-
-    帧重复：500 帧描述文件 → 27000 帧输出
-    """
-    concat_path = os.path.join(temp_dir, "concat.txt")
-    with open(concat_path, 'w', encoding='utf-8') as f:
-        for idx, state in enumerate(frame_states):
-            duration = state.frame_count / fps
-            if duration <= 0:
-                duration = 1.0 / fps
-            f.write(f"file 'frame_{idx:06d}.bmp'\n")
-            f.write(f"duration {duration:.6f}\n")
-        # FFmpeg concat 要求最后一帧重复写一次
-        if frame_states:
-            last_idx = len(frame_states) - 1
-            f.write(f"file 'frame_{last_idx:06d}.bmp'\n")
-    return concat_path
-
-
-def _build_drawtext_filter(
-    ust_info: dict, fps: int,
-) -> Optional[str]:
-    """构建 FFmpeg drawtext 滤镜（显示播放时间）。
-
-    样式从 ust_info 读取，与播放器一致。
-    """
-    sc = ust_info.get("show_config", {})
-    ps = ust_info.get("player_style", {})
-
-    if not sc.get("play_time", True):
-        return None
-
-    font_family = ps.get("info_font_family", "微软雅黑")
-    font_color = ps.get("info_text_color", "#ffffff")
-    font_file = _resolve_font_path(font_family)
-
-    # MM:SS:CC 格式，每帧自动计算
-    # FFmpeg drawtext: text='%{eif:floor(t/60):d:2}:%{eif:floor(t):d:2}:%{eif:floor(t*100):d:2}'
-    filter_str = (
-        f"drawtext=fontfile='{_escape_ffmpeg_path(font_file)}':"
-        f"text='%{{eif\\:floor(t/60)\\:d\\:2}}\\:"
-        f"%{{eif\\:mod(floor(t)\\,60)\\:d\\:2}}\\:"
-        f"%{{eif\\:floor(mod(t\\,1)*100)\\:d\\:2}}':"
-        f"fontcolor={font_color}:"
-        f"fontsize=14:"
-        f"x=20:y=h-20"
-    )
-    return filter_str
-
-
-def _encode_video(
-    frame_states: List[FrameState],
-    hw: HardwareInfo,
-    ust_info: dict,
-    temp_dir: str,
-    output_path: str,
-    fps: int,
-    width: int,
-    height: int,
-    progress_callback: Optional[Callable] = None,
-) -> bool:
-    """编码视频：帧重复 → drawtext 时间注入 → 音频合并。
-
-    Args:
-        frame_states: 唯一帧列表
-        hw: 硬件信息
-        ust_info: 配置
-        temp_dir: 临时目录
-        output_path: 输出 .mp4 路径
-        fps: 帧率
-        width, height: 分辨率
-        progress_callback: 进度回调
-    """
-    ffmpeg = _find_ffmpeg()
-    if not ffmpeg:
-        msg = "未找到 ffmpeg，无法编码视频"
-        logger.error(msg)
-        set_last_render_error(msg)
-        return False
-
-    try:
-        # ---- 5.1 生成 concat.txt ----
-        if progress_callback:
-            progress_callback(10, 100, "编码")
-        concat_path = _build_concat_file(frame_states, temp_dir, fps)
-
-        # ---- 5.2 组装 drawtext 滤镜 ----
-        drawtext_filter = _build_drawtext_filter(ust_info, fps)
-
-        # ---- 5.3 编码视频流 ----
-        video_output = os.path.join(temp_dir, "video_only.mp4")
-        if progress_callback:
-            progress_callback(20, 100, "编码")
-
-        # 基础 FFmpeg 命令
-        # concat 文件中的 duration 指令控制每帧持续时间，不要加 -r 覆盖
-        video_cmd = [
-            ffmpeg, "-y",
-            "-f", "concat",
-            "-safe", "0",
-            "-i", concat_path,
-        ]
-
-        # 滤镜：先 fps 做帧率转换（让每帧有独立 PTS），再 drawtext 画时间
-        if drawtext_filter:
-            video_cmd.extend(["-vf", f"fps={fps},{drawtext_filter}"])
-
-        # 编码器（不再重复 -r，fps 滤镜已控制帧率）
-        video_cmd.extend([
-            "-c:v", hw.encoder_name,
-            "-pix_fmt", "yuv420p",
-        ])
-
-        # 编码器特定参数
-        if "nvenc" in hw.encoder_name:
-            video_cmd.extend([
-                "-preset", "p4",
-                "-rc", "vbr",
-                "-cq", "23",
-                "-b:v", "0",
-            ])
-        elif "amf" in hw.encoder_name:
-            video_cmd.extend([
-                "-quality", "quality",
-                "-rc", "vbr_peak",
-                "-qp_i", "23", "-qp_p", "23",
-            ])
-        elif "qsv" in hw.encoder_name:
-            video_cmd.extend([
-                "-preset", "medium",
-                "-global_quality", "23",
-            ])
-        else:  # libx264
-            video_cmd.extend([
-                "-preset", "medium",
-                "-crf", "23",
-            ])
-
-        video_cmd.append(video_output)
-
-        # 多 NVENC 并行
-        if hw.nvenc_count > 1 and len(frame_states) > 200:
-            # 分段编码
-            if progress_callback:
-                progress_callback(30, 100, "编码")
-            _encode_dual_nvenc(
-                ffmpeg, frame_states, hw, temp_dir, fps,
-                concat_path, drawtext_filter, video_output,
-            )
-            if progress_callback:
-                progress_callback(75, 100, "编码")
-        else:
-            if progress_callback:
-                progress_callback(30, 100, "编码")
-            logger.info(f"FFmpeg 视频编码命令: {' '.join(video_cmd)}")
-
-            # 计算视频总时长，用于实时进度映射
-            total_duration = sum(s.frame_count for s in frame_states) / fps
-            process = subprocess.Popen(
-                video_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding='utf-8',
-                errors='replace',
-                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0,
-            )
-
-            # 实时读取 stderr，解析 time= 字段更新编码进度
-            # 只保留最近 200 行 stderr 用于错误报告，避免长视频时内存膨胀
-            _MAX_STDERR_LINES = 200
-            stderr_lines = []
-            assert process.stderr is not None
-            for line in process.stderr:
-                if len(stderr_lines) < _MAX_STDERR_LINES:
-                    stderr_lines.append(line)
-                else:
-                    # 超过上限时滚动替换，只保留最近 200 行
-                    stderr_lines.append(line)
-                    stderr_lines = stderr_lines[-_MAX_STDERR_LINES:]
-                m = re.search(r'time=(\d+):(\d+):(\d+)\.(\d+)', line)
-                if m and total_duration > 0:
-                    h, mn, s = int(m.group(1)), int(m.group(2)), int(m.group(3))
-                    frac_str = m.group(4)
-                    # 归一化到毫秒：2 位百分秒 → 3 位毫秒，3+ 位截取前 3
-                    if len(frac_str) >= 3:
-                        ms = int(frac_str[:3])
-                    else:
-                        ms = int(frac_str) * (10 ** (3 - len(frac_str)))
-                    current_time = h * 3600 + mn * 60 + ms / 1000
-                    time_frac = min(current_time / total_duration, 1.0)
-                    phase_progress = 30 + time_frac * 50  # 30% → 80%
-                    if progress_callback:
-                        progress_callback(int(phase_progress), 100, "编码")
-
-            process.wait()
-            returncode = process.returncode
-            stderr_text = ''.join(stderr_lines)
-
-            if returncode != 0:
-                tail = stderr_text.strip()[-1500:] if stderr_text else "(无 stderr 输出)"
-                msg = f"FFmpeg 视频编码失败 (退出码 {returncode}):\n{tail}"
-                logger.error(msg)
-                set_last_render_error(msg)
-                return False
-
-        if progress_callback:
-            progress_callback(80, 100, "编码")
-
-        # ---- 5.4 mux 音频 ----
-        audio_path = ust_info.get("player_style", {}).get("audio_path", "")
-        if audio_path and os.path.exists(audio_path):
-            if progress_callback:
-                progress_callback(90, 100, "编码")
-
-            mux_cmd = [
-                ffmpeg, "-y",
-                "-i", video_output,
-                "-i", audio_path,
-                "-c", "copy",
-                "-shortest",
-                output_path,
-            ]
-            logger.info(f"FFmpeg 音频合并命令: {' '.join(mux_cmd)}")
-            result = subprocess.run(
-                mux_cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=3600,
-                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0,
-            )
-            if result.returncode != 0:
-                tail = result.stderr.strip()[-1500:] if result.stderr else "(无 stderr 输出)"
-                msg = f"FFmpeg 音频合并失败 (退出码 {result.returncode}):\n{tail}"
-                logger.error(msg)
-                set_last_render_error(msg)
-                # 尝试使用视频文件作为输出
-                shutil.copy(video_output, output_path)
-        else:
-            # 无音频，直接复制视频
-            shutil.copy(video_output, output_path)
-
-        if progress_callback:
-            progress_callback(100, 100, "编码")
-
-        return True
-
-    except subprocess.TimeoutExpired:
-        msg = "FFmpeg 编码超时（超过 1 小时），已中止"
-        logger.error(msg)
-        set_last_render_error(msg)
-        return False
-    except Exception as e:
-        logger.exception("视频编码失败")
-        set_last_render_error(f"视频编码异常：{type(e).__name__}: {e}")
-        return False
-
-
-def _encode_dual_nvenc(
-    ffmpeg: str,
-    frame_states: List[FrameState],
-    hw: HardwareInfo,
-    temp_dir: str,
-    fps: int,
-    concat_path: str,
-    drawtext_filter: Optional[str],
-    video_output: str,
-) -> bool:
-    """双 NVENC 并行编码：将帧分段，两个 FFmpeg 进程并行编码，然后 concat。"""
-    total = len(frame_states)
-    mid = total // 2
-
-    # 生成两个子 concat 文件
-    def make_sub_concat(start: int, end: int, suffix: str) -> str:
-        sub_path = os.path.join(temp_dir, f"concat_{suffix}.txt")
-        with open(sub_path, 'w', encoding='utf-8') as f:
-            for i in range(start, end):
-                state = frame_states[i]
-                duration = state.frame_count / fps
-                if duration <= 0:
-                    duration = 1.0 / fps
-                f.write(f"file 'frame_{i:06d}.bmp'\n")
-                f.write(f"duration {duration:.6f}\n")
-            # 最后帧重复
-            f.write(f"file 'frame_{end - 1:06d}.bmp'\n")
-        return sub_path
-
-    concat_a = make_sub_concat(0, mid, "a")
-    concat_b = make_sub_concat(mid, total, "b")
-    output_a = os.path.join(temp_dir, "segment_a.mp4")
-    output_b = os.path.join(temp_dir, "segment_b.mp4")
-
-    def encode_segment(concat_file: str, output: str, device: int):
-        cmd = [
-            ffmpeg, "-y",
-            "-f", "concat", "-safe", "0", "-i", concat_file,
-        ]
-        if drawtext_filter:
-            cmd.extend(["-vf", f"fps={fps},{drawtext_filter}"])
-        cmd.extend([
-            "-c:v", hw.encoder_name,
-            "-pix_fmt", "yuv420p",
-            "-preset", "p4",
-            "-rc", "vbr",
-            "-cq", "23",
-            "-b:v", "0",
-            "-gpu", str(device),
-            output,
-        ])
-        subprocess.run(
-            cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=3600,
-            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0,
-        )
-
-    # 并行编码两个段，确保线程始终被 join（即使异常）
-    t1 = threading.Thread(target=encode_segment, args=(concat_a, output_a, 0))
-    t2 = threading.Thread(target=encode_segment, args=(concat_b, output_b, 1))
-    t1.start()
-    t2.start()
-    try:
-        t1.join()
-        t2.join()
-    except Exception:
-        # 确保线程引用被清理
-        t1.join(timeout=1)
-        t2.join(timeout=1)
-        raise
-
-    # 合并两个段
-    concat_list = os.path.join(temp_dir, "concat_segments.txt")
-    with open(concat_list, 'w', encoding='utf-8') as f:
-        f.write(f"file '{os.path.abspath(output_a).replace(chr(92), '/')}'\n")
-        f.write(f"file '{os.path.abspath(output_b).replace(chr(92), '/')}'\n")
-
-    merge_cmd = [
-        ffmpeg, "-y",
-        "-f", "concat", "-safe", "0", "-i", concat_list,
-        "-c", "copy",
-        video_output,
-    ]
-    result = subprocess.run(
-        merge_cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=3600,
-        creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0,
-    )
-    return result.returncode == 0
-
-
 # ===================== 主接口 =====================
 
 
@@ -2221,43 +2559,34 @@ def render_video(
     height: int = 1080,
     mode: str = "auto",
     render_backend: str = "auto",
-    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    progress_callback: Optional[Callable[[int, str], None]] = None,
 ) -> bool:
     """GPU 加速渲染导出 USTX 可视化视频。
 
     完整流程:
-        ① CPU 预计算所有帧的视觉状态 + 去重
+        ① CPU 预计算所有时间区间帧的视觉状态（不做视觉去重）
         ② 检测硬件 (GPU/CUDA/NVENC)
-        ③ 计算最优并发数 (渲染stream/编码worker)
-        ④ GPU 多 stream 并行渲染唯一帧 → PNG 落盘
-        ⑤ FFmpeg 帧重复编码 + drawtext 时间注入 + 音频 mux
-        ⑥ 清理临时文件
+        ③ 计算最优并发数
+        ④ 多线程渲染每个时间区间帧 → NV12 → FFmpeg 逐帧真实编码（正常 GOP）
+        ⑤ 音频合并 → 输出 .mp4
 
     Args:
         ust_info: build_ust_info() 生成的完整参数 dict
         output_path: 输出 .mp4 路径（必须存在父目录）
         fps: 输出帧率 (30/60/90/120)
         width, height: 输出分辨率
-        mode: 渲染编码模式 ("auto" / "batch" / "stream")
+        mode: 已废弃（保留参数以兼容旧调用方）。渲染/编码始终使用
+            "逐帧渲染 + 逐帧编码" 方案：不做去重，转音完整保留。
         render_backend: 渲染后端 ("auto" / "cuda" / "opengl" / "cpu")
-        progress_callback: 进度回调 callback(current, total, stage)
+        progress_callback: 进度回调 callback(pct_0_100, stage)
 
     Returns:
         是否成功
     """
-    import sys
-    program_root = os.path.dirname(os.path.abspath(sys.argv[0]))
-    temp_dir = os.path.join(program_root, "temp_render")
-
     # 确保输出目录存在
     output_dir = os.path.dirname(output_path)
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
-
-    # 清理旧临时目录
-    if os.path.exists(temp_dir):
-        shutil.rmtree(temp_dir)
-    os.makedirs(temp_dir, exist_ok=True)
 
     try:
         # 导出计时器：记录每个阶段耗时，最后输出到日志
@@ -2284,7 +2613,7 @@ def render_video(
                 if mapped > _last_pct[0]:
                     _last_pct[0] = mapped
                 out = _last_pct[0]
-            progress_callback(int(out), 100, stage)
+            progress_callback(int(out), stage)
 
         # ==================== 阶段 1: 预计算 ====================
         _emit_progress(0, "预计算")
@@ -2305,21 +2634,21 @@ def render_video(
 
         frame_states = precompute_frame_states(ust_info, fps, width, height)
         _emit_progress(60, "预计算")
-        unique_count = len(frame_states)
+        states_count = len(frame_states)
 
         total_output_frames = sum(s.frame_count for s in frame_states)
         logger.info(
-            f"预计算: {unique_count} 个唯一帧, "
+            f"预计算: {states_count} 个时间区间帧, "
             f"输出 {total_output_frames} 帧 (≈{total_output_frames / fps:.1f}s)"
         )
 
-        if unique_count == 0:
+        if states_count == 0:
             msg = "预计算产生 0 帧，无法导出"
             logger.error(msg)
             set_last_render_error(msg)
             return False
 
-        wc = calc_optimal_workers(hw, unique_count, width, height)
+        wc = calc_optimal_workers(hw, states_count, width, height)
         _emit_progress(80, "预计算")
         logger.info(
             f"并发配置: render_streams={wc.render_streams}, "
@@ -2329,12 +2658,8 @@ def render_video(
             f"per_frame={wc.per_frame_gb:.4f}GB"
         )
 
-        effective_mode = mode
-        if effective_mode == "auto":
-            effective_mode = wc.default_mode
-
         backend_name, render_func = _select_render_backend(hw, render_backend)
-        logger.info(f"渲染后端: {backend_name}, 模式: {effective_mode}")
+        logger.info(f"渲染后端: {backend_name} (逐帧渲染编码，不做去重)")
 
         # CPU 后端强制纯 CPU 编码，不碰任何 GPU 编码器
         if backend_name == "cpu":
@@ -2348,121 +2673,71 @@ def render_video(
         _precompute_elapsed = _t1 - _t0
         logger.info(f"[导出计时] 预计算阶段耗时: {_precompute_elapsed:.2f}s")
 
-        # ==================== 阶段 2: 渲染 ====================
+        # ==================== 阶段 2-3: 渲染 + 编码（内存管道） ====================
         _emit_progress(0, "GPU渲染")
 
-        # 初始化异步保存线程池：渲染只提交 GPU 任务，磁盘写入由独立线程池完成
-        _init_save_pool(max_workers=4)
-
-        def render_phase_cb(current, total, stage):
-            frac = current / total if total > 0 else 0
-            _emit_progress(frac * 100, stage)
-
-        # 多线程渲染（CUDA 和 CPU 后端均使用多线程并行）
-        # CUDA: 多线程并行渲染，每帧独立分配 GPU 帧缓冲，完成后释放
-        # CPU:  多线程 QPainter 渲染
         num_threads = wc.render_streams
 
-        # CUDA 后端：预构建字形图集（在主线程一次性上传所有文字纹理到 GPU，
-        # 避免渲染线程中并发上传导致 CuPy 线程安全问题）
+        # GLES 后端：GLES 非线程安全，强制单线程渲染
+        if backend_name == "opengl":
+            num_threads = 1
+            logger.info("GLES 后端：单线程渲染（GLES 非线程安全）")
+
+        # CUDA 后端：预构建字形图集
         if backend_name == "cuda":
             _clear_glyph_cache()
             _build_glyph_cache(frame_states, fonts)
-            logger.info(f"CUDA 后端：字形图集已预构建，开始 GPU 渲染 ({num_threads} 线程)")
+            logger.info(f"CUDA 后端：字形图集已预构建，开始渲染 ({num_threads} 线程)")
 
-        chunks: List[List[Tuple[int, FrameState]]] = []
-        for i, state in enumerate(frame_states):
-            chunk_idx = i % num_threads
-            while len(chunks) <= chunk_idx:
-                chunks.append([])
-            chunks[chunk_idx].append((i, state))
+        # 内存管道：逐帧渲染 → FFmpeg 逐帧编码（正常 GOP）
+        # 不做去重、不做比特流重复，保证转音完整
+        _t2 = time.monotonic()
+        success = _render_encode_pipeline(
+            frame_states=frame_states,
+            render_func=render_func,
+            width=width, height=height,
+            fonts=fonts,
+            num_threads=num_threads,
+            hw=hw,
+            ust_info=ust_info,
+            output_path=output_path,
+            fps=fps,
+            total_output=total_output_frames,
+            progress_callback=_emit_progress,
+            use_nv12=(backend_name == "cuda"),
+        )
+        _t3 = time.monotonic()
+        _render_elapsed = _t3 - _t2
 
-        with ThreadPoolExecutor(max_workers=num_threads) as executor:
-            futures = []
-            for chunk_idx, chunk in enumerate(chunks):
-                future = executor.submit(
-                    _render_chunk,
-                    chunk, render_func, width, height, fonts,
-                    temp_dir, render_phase_cb,
-                    progress_offset=sum(len(c) for c in chunks[:chunk_idx]),
-                    total=unique_count,
-                )
-                futures.append(future)
-
-            all_paths = []
-            for future in as_completed(futures):
-                try:
-                    paths = future.result()
-                    all_paths.extend(paths)
-                except Exception:
-                    logger.exception("渲染线程异常")
-                    set_last_render_error("渲染线程异常，详情见日志")
-
-        # 等待所有异步保存任务完成（渲染已全部提交，保存并行进行）
-        _wait_saves()
-        # 渲染/保存流水线结束，关闭保存线程池释放线程资源
-        _shutdown_save_pool()
-
-        # CUDA 后端：渲染完成后释放字形图集 + 线程上下文显存
+        # CUDA / GLES 后端：渲染完成后释放资源 + 时间戳纹理
         if backend_name == "cuda":
             _clear_glyph_cache()
             _clear_cuda_contexts()
+        elif backend_name == "opengl":
+            _clear_gles_context()
+        _clear_timestamp_cache()
 
-        logger.info(f"渲染完成: {len(all_paths)} 帧, 后端={backend_name}")
-        _emit_progress(100, "GPU渲染")
+        _emit_progress(100 if success else 99, "GPU渲染")
 
-        # 渲染阶段计时
-        _t2 = time.monotonic()
-        _render_elapsed = _t2 - _t1
-        _fps_render = len(all_paths) / _render_elapsed if _render_elapsed > 0 else 0
-        logger.info(f"[导出计时] 渲染阶段耗时: {_render_elapsed:.2f}s (约 {_fps_render:.1f} 帧/秒)")
-
-        # ==================== 阶段 3: 编码 ====================
-        _emit_progress(0, "编码")
-
-        def encode_phase_cb(current, total, stage):
-            frac = current / total if total > 0 else 0
-            _emit_progress(frac * 100, stage)
-
-        success = _encode_video(
-            frame_states, hw, ust_info, temp_dir,
-            output_path, fps, width, height,
-            encode_phase_cb,
-        )
-
-        _emit_progress(100 if success else 99, "编码")
-
-        # 编码阶段计时 + 导出总耗时汇总
-        _t3 = time.monotonic()
-        _encode_elapsed = _t3 - _t2
-        _total_elapsed = _t3 - _t0
+        _t4 = time.monotonic()
+        _encode_elapsed = _t4 - _t3
+        _total_elapsed = _t4 - _t0
         _out_frames = total_output_frames if success else 0
         logger.info(
+            f"[导出计时] 渲染阶段耗时: {_render_elapsed:.2f}s\n"
             f"[导出计时] 编码阶段耗时: {_encode_elapsed:.2f}s\n"
             f"[导出计时] 导出总耗时: {_total_elapsed:.2f}s\n"
             f"[导出计时] 各阶段占比: 预计算 {_precompute_elapsed:.1f}s | "
-            f"渲染 {_render_elapsed:.1f}s | 编码 {_encode_elapsed:.1f}s\n"
+            f"渲染+编码 {_render_elapsed:.1f}s | "
+            f"音频合并 {_encode_elapsed:.1f}s\n"
             f"[导出计时] 输出帧数: {_out_frames} 帧, "
             f"实际帧率: {_out_frames / _total_elapsed:.1f} fps"
         )
 
-        # ==================== 阶段 7: 清理 ====================
-        try:
-            # 保留临时文件用于调试
-            if success:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-        except Exception:
-            pass
-
+        # ==================== 清理 ====================
         # 显式释放大内存对象，减少内存占用
-        # frame_states 列表可能包含大量 FrameState 对象
-        # fonts 字典中的 QFont/QFontMetrics 对象占用大
-        # all_paths 列表中的路径字符串也占用内存
         del frame_states
         del fonts
-        del chunks
-        all_paths.clear()
-        # 强制触发一次垃圾回收，释放循环引用
         import gc
         gc.collect()
 
@@ -2471,11 +2746,6 @@ def render_video(
     except Exception as e:
         logger.exception("渲染导出失败")
         set_last_render_error(f"渲染导出异常：{type(e).__name__}: {e}")
-        # 清理临时文件
-        try:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        except Exception:
-            pass
         # 释放模块级缓存 + 强制 GC
         clear_renderer_cache()
         import gc

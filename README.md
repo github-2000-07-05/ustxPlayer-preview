@@ -4,7 +4,7 @@
 
 # ustxPlayer-preview
 
-`v26h07` · 基于 [ustxPlayer](https://github.com/SYEternalR/ustxPlayer) 二次开发的 USTX 工程可视化工具。
+`v26h8` · 基于 [ustxPlayer](https://github.com/SYEternalR/ustxPlayer) 二次开发的 USTX 工程可视化工具。
 
 ![GitHub Release](https://img.shields.io/github/v/release/lyrinXD/ustxPlayer?style=for-the-badge)
 ![GitHub All Releases](https://img.shields.io/github/downloads/lyrinXD/ustxPlayer/total?style=for-the-badge)
@@ -37,9 +37,8 @@
 ### 导出 MP4 视频
 - 点击播放按钮后选择「**导出为视频**」，进入内嵌于主窗口的**渲染导出页**，将 USTX 可视化画面（含逐字歌词、音高线、LRC 多语言歌词等）**离屏渲染**并编码为视频，画面与播放器所见一致。
 - **全参数设置**：分辨率（720P / 1080P / 2K / 4K / 自定义）、帧率（30 / 60 / 90 / 120 / 自定义，默认 60）。
-- **GPU 硬件加速渲染**：支持 CUDA / OpenGL / CPU 三种渲染后端，自动检测硬件可用性并禁用不可用项；CUDA 渲染可并行多 stream 渲染唯一帧后交给 FFmpeg 帧重复编码。
-- **智能预估**：自动计算唯一帧数、渲染并发与编码并发，预估导出耗时。
-- **渲染模式**：支持「渲染完再编码 / 边渲染边编码 / 自动」三种模式。
+- **GPU 硬件加速渲染**：支持 CUDA / OpenGL / CPU 三种渲染后端，自动检测硬件可用性并禁用不可用项；采用**逐帧渲染 + 逐帧编码**方案——不做视觉去重（`precompute_frame_states` 每个时间区间独立生成帧，保证转音曲线完整），CUDA 多 stream 并行渲染（NV12 直接输出，数据不出 GPU），NVENC 按正常 GOP 逐帧真实编码，转音 100% 保留。
+- **智能预估**：自动计算时间区间帧数、渲染并发与编码并发，预估导出耗时。
 - **进度可视化**：进度条 + 阶段文字 + Windows 任务栏进度，导出中可取消。
 - **错误日志**：失败时显示原因并可直接打开日志文件，便于提交 [Issues](https://github.com/lyrinXD/ustxPlayer/issues) 反馈。
 - **内置 ffmpeg**：通过依赖 [imageio-ffmpeg](https://pypi.org/project/imageio-ffmpeg/) 自带编码器，无需用户额外安装。
@@ -132,8 +131,8 @@ python -m PyInstaller --onefile --windowed --icon=icon.ico --name=ustxPlayer \
 
 本项目沿用原项目（ustxPlayer）的使用协议，使用前请务必阅读并同意相关使用协议：
 
-- 软件内入口：`其他 > 关于软件`，点击「上游使用协议」或「GNU LGPL v3.0」即可在软件内直接查看全文
-- 程序目录下 [`Terms.txt`](Terms.txt)（上游使用协议）与 [`LICENSE`](LICENSE)（GNU LGPL v3.0）
+- 软件内入口：`其他 > 关于软件`，点击「上游使用协议」或「GNU GPL v3.0」即可在软件内直接查看全文
+- 程序目录下 [`Terms.txt`](Terms.txt)（上游使用协议）与 [`LICENSE`](LICENSE)（GNU GPL v3.0）
 
 ustxPlayer 原项目版权由 SYEternalR 所有。本项目（ustxPlayer-preview）在 ustxPlayer 基础上进行二次开发，授权给符合条件的用户免费使用。
 

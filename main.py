@@ -2,7 +2,7 @@
 """提供侧边导航的现代化界面。"""
 
 # 软件版本号常量，所有文件引用此常量保证一致
-APP_VERSION = "v26h07"
+APP_VERSION = "v26h8"
 
 import os
 import sys
@@ -616,7 +616,7 @@ def main():
 
     # 启动动画：动画先行，主窗口在动画播放期间创建，动画结束淡出时再显示
     from ui.splash_screen import SplashScreen
-    splash = SplashScreen(icon_path=os.path.join(program_root, "icon.png"))
+    splash = SplashScreen(icon_path=os.path.join(program_root, "icon.ico"))
     splash.show()
     splash.fade_in()
     splash.set_message("正在加载界面...")

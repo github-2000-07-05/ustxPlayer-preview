@@ -38,7 +38,7 @@ from core.log import logger
 try:
     from main import APP_VERSION
 except ImportError:
-    APP_VERSION = "v26h07"
+    APP_VERSION = "v26h8"
 
 # 卡片与图标尺寸
 _CARD_W, _CARD_H = 360, 250

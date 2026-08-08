@@ -3,6 +3,61 @@
 > [!TIP]
 > 本文档部分使用AI编写
 
+## v26h8 (2026-08-08) - 转音修复与逐帧渲染编码
+
+---
+
+### 🔄 渲染方案变更：移除自动去重，改为逐帧渲染 + 逐帧真实编码
+
+- **背景**：用户反馈「存多少帧就渲染多少帧」——即使 cache_key 已含音高曲线坐标，自动去重合并（相邻相同状态合并、编码后按 frame_count 重复）仍被用户视为转音丢失的隐患。
+- **变更**：
+  - `precompute_frame_states`：删除 `seen_cache_keys` 去重合并逻辑，每个时间区间独立生成 FrameState（不做视觉合并）。
+  - `_render_unique_encode_pipeline` → `_render_encode_pipeline`：删除 `-g 1`（每帧 IDR）与 `_parse_h264_frames` 比特流解析/重复 hack，改为**正常 GOP 逐帧真实编码**——编码线程按 `frame_count` 把每帧写入 FFmpeg pipe，10153 帧全部真实编码。
+  - 删除 `_parse_h264_frames`（不再需要比特流重复）。
+- **效果**：730 个时间区间帧全部独立渲染（其中 701 帧含转音曲线），输出 10153 帧逐帧编码，转音完整保留。
+- **性能代价**：编码量从 730 帧（去重后）恢复到 10153 帧（总输出帧），GLES 后端 1080p30 导出约 64s；换取转音 100% 正确。
+- **UI**：预估逻辑改为 `encode_time = total_frames / fps * enc_coef`（编码量 = 总输出帧数），方案文案更新为「逐帧编码」。
+
+---
+
+### 🎨 OpenGL (GLES) 渲染后端（合并自 tests/cuda 验证方案）
+
+- **原理**：`QOpenGLContext + QOffscreenSurface` 创建离屏上下文，`QOpenGLFramebufferObject` 作为离屏渲染目标，`QOpenGLPaintDevice` 桥接 `QPainter` 到 GPU 绘制——**完全复用 `_draw_with_painter` 绘制代码**，一份代码 CPU / GLES 后端共用。
+- **渲染**：GLES 非线程安全，强制单线程渲染；`glReadPixels` 同步回读 RGBA（`Format_RGBA8888`），由编码线程通过 `_rgba_to_nv12_cpu`（BT.601 整数运算）异步转换 NV12，不阻塞渲染。
+- **性能**：1080P 单帧渲染约 8ms（126fps），730 唯一帧渲染约 6s；整机管线（渲染+编码+音频合并）约 34s 完成 10153 帧（≈338s 视频），295fps 实际帧率。
+- **兼容性**：所有显卡可用（NVIDIA / AMD / Intel 核显均支持），不需要 CUDA；GLES 初始化失败自动回退 CPU 渲染，不崩溃。
+- **UI**：渲染后端下拉框恢复「OpenGL (通用)」选项；预估耗时 `BACKEND_FRAME_TIME` 更新 `opengl: 0.008s`，估算走 `_select_render_backend()` 实际后端保持一致。
+
+### 🐛 转音（Portamento）丢失修复
+
+- **根因**：帧去重的 cache_key 之前只记录音高线点数（`str(len(pitch_points))`），不记录实际坐标。当两个相邻时间段显示文本（歌词/音名）相同、但转音曲线不同且点数恰好相同时，后一个状态被错误合并进前一个状态，**转音曲线随帧一起丢失**。
+- **修复**：cache_key 纳入 `pitch_points` 实际坐标，曲线不同的帧不再合并。修复后同一工程去重帧数从 638 增至 730（其中 701 帧含转音曲线），转音被完整保留。
+
+### ⚡ 唯一帧 H.264 I 帧重复编码（合并自 tests/cuda 验证方案）
+
+- **原理**：NVENC 只编码去重后的唯一帧（`-g 1` 每帧都是 IDR），再在 H.264 比特流层面解析 NAL 单元、按帧数重复。编码量 = 唯一帧数（本工程约 730/10153，减少 ~14 倍）。
+- **渲染**：CUDA 多 stream 并行渲染唯一帧 → NV12（GPU 直接转换，跳过 QImage 与 RGBA 下载）。
+- **编码**：唯一帧 NV12 直接 pipe 喂给 FFmpeg（-g 1），输出临时 .h264。
+- **重复**：解析 .h264 的 SPS/PPS 与各帧 NAL，按 `frame_count` 一次性拼接（chunk 乘法）写入最终 .h264。
+- **性能**：1080p 30fps 约 5 分 38 秒的工程（10153 帧），CUDA 后端完整导出（含音频合并）约 15 秒，实际帧率 >650 fps。
+
+### 🔧 编码器与封装修复
+
+- **SPS/PPS 重复导致 MP4 Duration=N/A**：NVENC 在 `-g 1` 时每个 IDR 帧前都会重复写 SPS/PPS，`_parse_h264_frames` 之前把所有参数集都拼进文件头部（数百组），FFmpeg 解析 access unit 错乱，MP4 封装后 `Duration: N/A`。修复为每组参数集只保留一组（SPS 与 PPS 全局一致）。
+- **裸 H.264 无 PTS 导致音频丢失**：裸 H.264 输入没有 PTS，直接 `-c copy` 到 MP4 时 mov muxer 无法 interleave（`time=N/A`、`audio:0KiB`、无音频流）。改为先封装成 MPEG-TS（生成正确 PTS），再与音频（FLAC 转 AAC 192k）转封装为 MP4，视频、音频、时长均正确。
+
+### 🗑 移除渲染模式选择
+
+- 界面移除「渲染完再编码 / 边渲染边编码 / 自动」模式下拉框及显存不足禁用提示，`render_video` 的 `mode` 参数保留但已固定为「逐帧渲染 + 逐帧编码」方案（不做去重）。
+- 删除旧 batch（渲染到磁盘）与 stream（逐帧 pipe）模式的死代码（`_render_frames_to_disk` / `_encode_frames_from_disk` / `_encode_video_pipe` / `_render_and_encode_pipeline` / drawtext 滤镜相关辅助）。
+
+### 🧪 新增测试
+
+- `tests/openGL/test_pitch_bend_dedup_fix.py`：构造「同文本不同转音曲线」用例，验证去重不再吞帧。
+- `tests/cuda/integrate_render_video.py`：调用主项目 `render_video` 完整导出，验证转音保留、Duration 与音频流正确、导出耗时。
+
+---
+
 ## v26h07 (2026-08-07) - 导出计时器与性能优化
 
 ---
